@@ -7,7 +7,7 @@
 .
 ├── LICENSE
 ├── README.md
-├── data_managers
+├── data_processing
 │   ├── data_manager.py       # Data processing
 │   └── ...
 └── ...
