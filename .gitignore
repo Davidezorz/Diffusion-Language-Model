@@ -1,5 +1,6 @@
-# weights
+# weights and logs
 .weights/
+lightning_logs/
 
 # data
 .data/
