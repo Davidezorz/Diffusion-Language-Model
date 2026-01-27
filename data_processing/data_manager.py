@@ -54,8 +54,8 @@ class DataManager():
 
 
     def _group_texts(self, dataset, T):
-        input_blocks = []
-        attn_masks = []
+        input_blocks  = []
+        attn_masks    = []
         output_blocks = []
 
         for ids in dataset['input_ids']:
@@ -77,11 +77,11 @@ class DataManager():
                 mask[:length] = 1
 
                 input_blocks.append(in_block)
-                output_blocks.append(out_block)
                 attn_masks.append(mask)
+                output_blocks.append(out_block)
 
         return {'input_ids':        input_blocks, 
-                'attention_mask':   attn_masks, 
+                'attention_mask':   attn_masks,
                 'output_ids':       output_blocks}
 
 

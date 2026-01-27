@@ -161,8 +161,8 @@ class MultiHeadAttention(nn.Module):
         
         if seqlens is not None:                                                 # ◀── handle sequence length
             mask_seqlen = self._create_seqlens_mask(seqlens, T, q.device)       
-            mask =  mask | mask_seqlen           
-        
+            mask =  (mask | mask_seqlen).unsqueeze(1)        
+
         attn_scores = attn_scores.masked_fill(mask, float('-inf'))              # ◀─┤ B H T T 
         attn_probs = F.softmax(attn_scores, dim=-1)                             # ◀─┤ B H T T 
         x = attn_probs @ v                                                      # ◀─╯ B H T c
@@ -180,35 +180,56 @@ class MultiHeadAttention(nn.Module):
         qkv = flash_attn.layers.rotary.apply_rotary_emb_qkv_(qkv, cos, sin)     # ◀─╯  B T 3 H c
         
         qkv = rearrange(qkv, 'B T ... -> (B T) ...')                            # (B T) 3 H c
-        cu_seqlens, max_seqlen = self.compute_cu_seqlens(seqlens, B, T, device)
-
-        x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(   #   ╭ compute attention 
-            qkv, cu_seqlens, max_seqlen, 0., causal=True )                      # ◀─╯ (B T) 3 H c
+        
+        avaible = seqlens is not None
+        flash_attn = self._flash_attn_seqlens if avaible else self._flash_attn
+        x = flash_attn(qkv, seqlens, B, T, device)
         
         return rearrange(x, '(B T) H c -> B T (H c)', B=B)                      # B T C
+
+
+    def _flash_attn(self, qkv, seqlens, B, T, device):
+        int32 = torch.int32
+        cu_seqlens = torch.arange(0, (B+1)*T, T, dtype=int32, device=device)
+
+        x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(   #   ╭ compute attention
+            qkv, cu_seqlens, T, 0., causal=True)                                # ◀─╯ (B T) 3 H c
+        
+        return x
+    
+
+    def _flash_attn_seqlens(self, qkv, seqlens, B, T, device):
+        seqlens = seqlens.to(dtype=torch.int32)
+
+        zero = torch.tensor([0], dtype=torch.int32, device=device)              #   ╭ compute the
+        cu_seqlens = torch.cat((zero, seqlens.cumsum(0)))                       # ◀─╯ cu_seqlens
+        max_seqlen = seqlens.max().item()
+
+        valid_mask = ~self._compute_mask_row(seqlens, T, device).flatten()      # ◀── qvk packing
+        qkv_packed = qkv[valid_mask]
+
+        x_p = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func( #   ╭ compute attention
+            qkv_packed, cu_seqlens, max_seqlen, 0., causal=True)                # ◀─╯ (B T) 3 H c
+
+        x = torch.zeros((B*T, self.H, self.c), device=device, dtype=x_p.dtype)  #   ╭ qvk unpacking  
+        x[valid_mask] = x_p                                                     # ◀─╯
+
+        return x
         
 
-    def compute_cu_seqlens(self, seqlens, B, T, device):                        # ◀── B + 1, compute the cumulative sequence length
-        if seqlens == None:
-            cu_seqlens = torch.arange(0, (B+1)*T, T, 
-                                      dtype=torch.int32, device=device)
-            max_seqlen = T
-        else:
-            zero = torch.tensor([0], dtype=torch.int32, device=device)
-            cu_seqlens = torch.cat((zero, seqlens.cumsum(0)))
-            max_seqlen = seqlens.max().item()
-
-        return cu_seqlens, max_seqlen
-
-    
     def _create_causal_mask(self, T, device):
-        mask = torch.triu(torch.ones(T, T, device=device), diagonal=1)          # Create causal mask for autoregressive attention
-        return mask.bool() 
+        mask = torch.triu(torch.ones(T, T, device=device), diagonal=1)          # Create causal mask for 
+        return mask.bool()                                                      # autoregressive attention
     
 
-    def _create_seqlens_mask(self, seqlens, T, device):
+    def _compute_mask_row(self, seqlens, T, device):
         indices = torch.arange(T, dtype=torch.int32, device=device)
         mask_row = indices.unsqueeze(0) >= seqlens.unsqueeze(1)
+        return mask_row
+
+
+    def _create_seqlens_mask(self, seqlens, T, device):
+        mask_row = self._compute_mask_row(seqlens, T, device)
         mask = mask_row.unsqueeze(1).expand(-1, T, -1)
         return mask.bool()
 

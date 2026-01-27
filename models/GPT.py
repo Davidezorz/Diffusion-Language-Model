@@ -55,12 +55,16 @@ class  GPT(L.LightningModule):
 
 
     def training_step(self, batch, batch_idx):
-        loss = self.loss(batch['input_ids'], batch['output_ids'])
+        B, T = batch['input_ids'].shape
+        seqlens = batch['attention_mask'].sum(dim=-1)
+        seqlens = seqlens if seqlens.sum() != B*T else None
+
+        loss = self.loss(batch['input_ids'], batch['output_ids'], seqlens)
         return loss
     
 
-    def loss(self, input, output):
-        logits = self.backbone(input)
+    def loss(self, input, output, seqlens=None):
+        logits = self.backbone(input, seqlens)
         B, T, V = logits.shape
 
         logits = logits.view(B*T, V)
