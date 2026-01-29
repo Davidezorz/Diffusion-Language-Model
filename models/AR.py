@@ -38,7 +38,7 @@ class Rotary(torch.nn.Module):
         
         self.T_cached = -1                                                      # we will store the cos and sin values for the max T yet
 
-    
+
     def forward(self, x):
         T = x.shape[1]
         dtype = self.inv_freq.dtype
@@ -161,7 +161,7 @@ class MultiHeadAttention(nn.Module):
         
         if seqlens is not None:                                                 # ◀── handle sequence length
             mask_seqlen = self._create_seqlens_mask(seqlens, T, q.device)       
-            mask =  (mask | mask_seqlen).unsqueeze(1)        
+            mask =  (mask | mask_seqlen).unsqueeze(1)
 
         attn_scores = attn_scores.masked_fill(mask, float('-inf'))              # ◀─┤ B H T T 
         attn_probs = F.softmax(attn_scores, dim=-1)                             # ◀─┤ B H T T 

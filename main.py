@@ -45,7 +45,6 @@ if __name__ == '__main__':
     print(len(process_tokens['input_ids']))
 
     
-    
     n_pad, tot = 0, 0
     pad_str = data_manager.tokenizer.pad_token
     pad = torch.tensor(data_manager.tokenizer.encode(pad_str))
@@ -67,6 +66,7 @@ if __name__ == '__main__':
                 H = H,                                  # ◀ number of heads
                 N = N,                                  # ◀ number of blocks
                 )
+    print(f"\nmodel parameters: {utils.utils.numberOfparameters(model)}")
     gpt = GPT(data_manager.tokenizer, model, B).to(device)
 
     print('\nmodel testing:')
@@ -86,7 +86,8 @@ if __name__ == '__main__':
 
     trainer.fit(
         model=gpt, 
-        train_dataloaders=train_loader
+        train_dataloaders=train_loader,
+        val_dataloaders=train_loader
     )
     
     gpt.to(device)
