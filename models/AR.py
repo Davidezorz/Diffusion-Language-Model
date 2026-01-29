@@ -119,13 +119,17 @@ class MultiHeadAttention(nn.Module):
         
         self.C, self.H = C, H
         self.c         = int(C // H)
-
+        
         self.W_qkv     = nn.Linear(C, 3 * C, bias=False)
         self.W_o       = nn.Linear(C, C) 
         self.dropout   = nn.Dropout(p_dropout)
 
-        cuda = torch.cuda.is_available()
-        self.attention = self._attention_cuda if cuda else self._attention
+        # attention function choice
+        self.attention = self._attention_sdpa
+
+        cuda_available = torch.cuda.is_available()
+        if cuda_available and torch.cuda.get_device_capability()[0] >= 8:
+            self.attention = self._attention_flash_lib
 
         self.register_buffer("mask", None)
         
@@ -146,38 +150,41 @@ class MultiHeadAttention(nn.Module):
         return x    
 
 
-    def _attention(self, qkv, rotary_cos_sin, seqlens):
+    def _attention_sdpa(self, qkv, rotary_cos_sin, seqlens):
         B, T, _, H, c = qkv.shape 
-        cos, sin = rotary_cos_sin                                               #  ╭ rotary positional embedding 
-        qkv = qkv * cos + rotate_half(qkv) * sin                                # ◀╯ B T three H c  
 
-        qkv = rearrange(qkv, 'B T three H c -> B three H T c')
-        q, k, v = qkv.unbind(dim=1)                                             # B three H S c -> 3 * B H T c
+        if rotary_cos_sin is not None:
+            cos, sin = rotary_cos_sin                                           #  ╭ rotary positional embedding 
+            qkv = qkv * cos + rotate_half(qkv) * sin                            # ◀╯ B T three H c  
 
-        c = q.shape[-1]                                                         #   ╭ compute attention
-        attn_scores = (q @ k.transpose(-2, -1)) * (c ** -0.5)                   # ◀─┤ B H T T
-
-        mask = self._create_causal_mask(T, q.device)                            # ◀─┤ T T
+        qkv = rearrange(qkv, 'B T three H c -> three B H T c')
+        q, k, v = qkv.unbind(dim=0)                                             # B three H S c -> 3 * B H T c
         
-        if seqlens is not None:                                                 # ◀── handle sequence length
+        mask, is_causal = None, True
+        if seqlens is not None:                                                # ◀── handle sequence length
+            is_causal = False
+            mask = self._create_causal_mask(T, q.device)                       # ◀─┤ T T
             mask_seqlen = self._create_seqlens_mask(seqlens, T, q.device)       
             mask =  (mask | mask_seqlen).unsqueeze(1)
 
-        attn_scores = attn_scores.masked_fill(mask, float('-inf'))              # ◀─┤ B H T T 
-        attn_probs = F.softmax(attn_scores, dim=-1)                             # ◀─┤ B H T T 
-        x = attn_probs @ v                                                      # ◀─╯ B H T c
-
+        x = F.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask=mask, 
+            dropout_p=0., 
+            is_causal=is_causal
+        )
         return rearrange(x, 'B H T c -> B T (H c)')                             # B T C
 
 
-    def _attention_cuda(self, qkv, rotary_cos_sin, seqlens):
+    def _attention_flash_lib(self, qkv, rotary_cos_sin, seqlens):
         B, T, _, H, c = qkv.shape
         device        = qkv.device
-   
-        cos, sin = rotary_cos_sin                                               #   ╭ rotary positional embedding  
-        cos = cos[0, :, 0, 0, :cos.shape[-1]//2].to(qkv.dtype)                  # ◀─┤  T c//2
-        sin = sin[0, :, 0, 0, :sin.shape[-1]//2].to(qkv.dtype)                  # ◀─┤  T c//2
-        qkv = flash_attn.layers.rotary.apply_rotary_emb_qkv_(qkv, cos, sin)     # ◀─╯  B T 3 H c
+
+        if rotary_cos_sin is not None:
+            cos, sin = rotary_cos_sin                                           #   ╭ rotary positional embedding  
+            cos = cos[0, :, 0, 0, :cos.shape[-1]//2].to(qkv.dtype)              # ◀─┤  T c//2
+            sin = sin[0, :, 0, 0, :sin.shape[-1]//2].to(qkv.dtype)              # ◀─┤  T c//2
+            qkv = flash_attn.layers.rotary.apply_rotary_emb_qkv_(qkv, cos, sin) # ◀─╯  B T 3 H c
         
         qkv = rearrange(qkv, 'B T ... -> (B T) ...')                            # (B T) 3 H c
         
