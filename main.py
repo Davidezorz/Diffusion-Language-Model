@@ -5,12 +5,12 @@ import datasets
 
 from data_processing.data_manager import DataManager
 import utils.utils
-from models.GPT import GPT
+from GPT_Lightning import GPT
 from models.AR import AR
 
 
 
-if __name__ == '__main__':
+def main():
     print('online\n')
     n_processes = 4
     caching_directory = '.data/'
@@ -61,13 +61,13 @@ if __name__ == '__main__':
     train_loader = data_manager.getTrainloader(process_tokens, B)
     
 
-    model = AR( V = len(data_manager.tokenizer),        # ◀ vocabulary size
-                C = C,                                  # ◀ embedding dimension
-                H = H,                                  # ◀ number of heads
-                N = N,                                  # ◀ number of blocks
-                )
-    print(f"\nmodel parameters: {utils.utils.numberOfparameters(model)}")
-    gpt = GPT(data_manager.tokenizer, model, B).to(device)
+    backbone = AR( V = len(data_manager.tokenizer),                     # ◀ vocabulary size
+                            C = C,                                              # ◀ embedding dimension
+                            H = H,                                              # ◀ number of heads
+                            N = N,                                              # ◀ number of blocks
+                        )
+    print(f"\nmodel parameters: {utils.utils.numberOfparameters(backbone)}")
+    gpt = GPT(data_manager.tokenizer, backbone, B).to(device)
 
     print('\nmodel testing:')
     gen = gpt.generate(torch.tensor([[1]], device=device), 20)
@@ -94,3 +94,9 @@ if __name__ == '__main__':
     print('\nmodel testing:')
     gen = gpt.generate(torch.tensor([[1]], device=device), 200)
     print(gpt.tokenizer.decode(gen[0]))
+
+
+
+
+if __name__ == '__main__':
+    main()

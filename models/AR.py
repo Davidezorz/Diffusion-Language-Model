@@ -6,9 +6,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-if torch.cuda.is_available():
+import warnings
+try:
     import flash_attn
     import flash_attn.layers.rotary
+    flash_attn_imported = True
+except ImportError:
+    flash_attn_imported = False
 
 
 """
@@ -37,7 +41,9 @@ class Rotary(torch.nn.Module):
         self.register_buffer('inv_freq', inv_freq)
         
         self.T_cached = -1                                                      # we will store the cos and sin values for the max T yet
-
+        self.register_buffer("cos", None, persistent=False)
+        self.register_buffer("sin", None, persistent=False)
+        
 
     def forward(self, x):
         T = x.shape[1]
@@ -128,7 +134,8 @@ class MultiHeadAttention(nn.Module):
         self.attention = self._attention_sdpa
 
         cuda_available = torch.cuda.is_available()
-        if cuda_available and torch.cuda.get_device_capability()[0] >= 8:
+        if cuda_available and torch.cuda.get_device_capability()[0] >= 8 \
+            and flash_attn_imported:
             self.attention = self._attention_flash_lib
 
         self.register_buffer("mask", None)
@@ -140,16 +147,19 @@ class MultiHeadAttention(nn.Module):
         rotary_cos_sin: cosine and sine tensor from Rotary class
         seqlens:        B T, how long is each sequence 
         """
+        attention = self.attention                                              #  ╭ if we are not on a cuda device
+        if x.device.type != 'cuda': attention = self._attention_sdpa            # ◀╯ we cannot use flash_atten
+                                              
         qkv = self.W_qkv(x)                                                     # B T (three C)
         qkv = rearrange(qkv, 'B T (three H c) -> B T three H c',                # B T three H c
                         three=3, H=self.H)
         
-        x = self.attention(qkv, rotary_cos_sin, seqlens)                        # B T C 
+        x = attention(qkv, rotary_cos_sin, seqlens)                             # B T C 
         x = self.dropout(self.W_o(x))                                           # B T C 
 
         return x    
 
-
+        
     def _attention_sdpa(self, qkv, rotary_cos_sin, seqlens):
         B, T, _, H, c = qkv.shape 
 
@@ -188,9 +198,9 @@ class MultiHeadAttention(nn.Module):
         
         qkv = rearrange(qkv, 'B T ... -> (B T) ...')                            # (B T) 3 H c
         
-        avaible = seqlens is not None
-        flash_attn = self._flash_attn_seqlens if avaible else self._flash_attn
-        x = flash_attn(qkv, seqlens, B, T, device)
+        available = seqlens is not None
+        flash_fn = self._flash_attn_seqlens if available else self._flash_attn
+        x = flash_fn(qkv, seqlens, B, T, device)
         
         return rearrange(x, '(B T) H c -> B T (H c)', B=B)                      # B T C
 
@@ -334,20 +344,20 @@ class AR(nn.Module):
 
 
     def save(self, folder='.weights/', name=None):                              # ◀┬─ save model 
-        name = self.name + '.pth' if name else 'model.pth'                      #  │  weights
+        name = self.name + '.pth' if name is not None else 'model.pth'          #  │  weights
         file = folder + name                                                    #  │
         torch.save(self.state_dict(), file)                                     #  ╯
 
 
     def load(self, folder='.weights/', name=None):                              # ◀┬─ load model
-        name = self.name + '.pth' if name else 'model.pth'                      #  │  weights
+        name = self.name + '.pth' if name is not None else 'model.pth'          #  │  weights
         file = folder + name                                                    #  │ 
         try:                                                                    #  │ 
             self.load_state_dict(torch.load(file, weights_only=True))           #  │
             print('model loaded')                                               #  │
         except Exception as e:                                                  #  │
-            print("Model weights not avaiable \n\n", e)                         #  ╯
-
+            warnings.warn(f"Model weights not avaiable. \n Error: \n {e}\n", e) #  ╯
+             
 
     def forward(self, indices, seqlens=None):
         x = self.embedding(indices)
