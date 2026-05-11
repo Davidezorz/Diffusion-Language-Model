@@ -119,7 +119,11 @@ class LayerNorm(nn.Module):
 # ╰───────────────────────────────────────────────────────────────────────────╯
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, C: int = 256, H: int = 8, p_dropout: float = 0.1):
+    def __init__(self, 
+                 C:         int  = 256, 
+                 H:         int   = 8, 
+                 p_dropout: float = 0.1, 
+                 is_causal: bool  = True):
         super().__init__()
         assert C % H == 0, "embedding dimension C must be divisible by the number of heads H"
         
@@ -139,6 +143,7 @@ class MultiHeadAttention(nn.Module):
             self.attention = self._attention_flash_lib
 
         self.register_buffer("mask", None)
+        self.is_causal = is_causal
         
 
     def forward(self, x, rotary_cos_sin, seqlens):
@@ -162,6 +167,7 @@ class MultiHeadAttention(nn.Module):
         
     def _attention_sdpa(self, qkv, rotary_cos_sin, seqlens):
         B, T, _, H, c = qkv.shape 
+        is_causal = self.is_causal
 
         if rotary_cos_sin is not None:
             cos, sin = rotary_cos_sin                                           #  ╭ rotary positional embedding 
@@ -170,12 +176,12 @@ class MultiHeadAttention(nn.Module):
         qkv = rearrange(qkv, 'B T three H c -> three B H T c')
         q, k, v = qkv.unbind(dim=0)                                             # B three H S c -> 3 * B H T c
         
-        mask, is_causal = None, True
+        mask, causal_mask = None, 0
         if seqlens is not None:                                                # ◀── handle sequence length
-            is_causal = False
-            mask = self._create_causal_mask(T, q.device)                       # ◀─┤ T T
+            if is_causal: causal_mask = self._create_causal_mask(T, q.device)                # ◀─┤ T T
             mask_seqlen = self._create_seqlens_mask(seqlens, T, q.device)       
-            mask =  (mask | mask_seqlen).unsqueeze(1)
+            mask =  ~(causal_mask | mask_seqlen).unsqueeze(1)
+            is_causal = False
 
         x = F.scaled_dot_product_attention(
             q, k, v, 
@@ -210,7 +216,7 @@ class MultiHeadAttention(nn.Module):
         cu_seqlens = torch.arange(0, (B+1)*T, T, dtype=int32, device=device)
 
         x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(   #   ╭ compute attention
-            qkv, cu_seqlens, T, 0., causal=True)                                # ◀─╯ (B T) 3 H c
+            qkv, cu_seqlens, T, 0., causal=self.is_causal)                      # ◀─╯ (B T) 3 H c
         
         return x
     
@@ -226,7 +232,7 @@ class MultiHeadAttention(nn.Module):
         qkv_packed = qkv[valid_mask]
 
         x_p = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func( #   ╭ compute attention
-            qkv_packed, cu_seqlens, max_seqlen, 0., causal=True)                # ◀─╯ (B T) 3 H c
+            qkv_packed, cu_seqlens, max_seqlen, 0., causal=self.is_causal)      # ◀─╯ (B T) 3 H c
 
         x = torch.zeros((B*T, self.H, self.c), device=device, dtype=x_p.dtype)  #   ╭ qvk unpacking  
         x[valid_mask] = x_p                                                     # ◀─╯
@@ -242,12 +248,12 @@ class MultiHeadAttention(nn.Module):
     def _compute_mask_row(self, seqlens, T, device):
         indices = torch.arange(T, dtype=torch.int32, device=device)
         mask_row = indices.unsqueeze(0) >= seqlens.unsqueeze(1)
-        return mask_row
+        return mask_row                                                         # B T
 
 
     def _create_seqlens_mask(self, seqlens, T, device):
-        mask_row = self._compute_mask_row(seqlens, T, device)
-        mask = mask_row.unsqueeze(1).expand(-1, T, -1)
+        mask_row = self._compute_mask_row(seqlens, T, device)                   # B T
+        mask = mask_row.unsqueeze(1).expand(-1, T, -1)                          # B T T
         return mask.bool()
 
 
@@ -277,12 +283,14 @@ class FeedForward(nn.Module):
 
 
 class Block(nn.Module):                                               
-    def __init__(self, C, H, p_dropout=0.1, FFN_ratio=4):      
+    def __init__(self, C, H, p_dropout=0.1, FFN_ratio=4, is_causal=True):      
         super().__init__()                                               
         self.H         = H
 
         self.norm1     = LayerNorm(C)
-        self.attention = MultiHeadAttention(C, H)
+        self.attention = MultiHeadAttention(C, H, 
+                                            p_dropout=p_dropout,
+                                            is_causal=is_causal)
         self.dropout1  = nn.Dropout(p_dropout)
 
         self.norm2     = LayerNorm(C)

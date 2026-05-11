@@ -59,13 +59,22 @@ def main():
     print(f"p:     {n_pad/tot*100: .2f}%")
 
     train_loader = data_manager.getTrainloader(process_tokens, B)
+
+
+    print(f"\nTesting grainloader:")
+    for batch in train_loader:
+        seqlens = batch.get('attention_mask')
+        print(f"input_ids:  {batch['input_ids'].shape}")
+        print(f"output_ids: {batch['output_ids'].shape}")
+        print(f"seqlens:    {seqlens.shape}\n")
+        break
     
 
-    backbone = AR( V = len(data_manager.tokenizer),                     # ◀ vocabulary size
-                            C = C,                                              # ◀ embedding dimension
-                            H = H,                                              # ◀ number of heads
-                            N = N,                                              # ◀ number of blocks
-                        )
+    backbone = AR(V = len(data_manager.tokenizer),                    # ◀ vocabulary size
+                  C = C,                                              # ◀ embedding dimension
+                  H = H,                                              # ◀ number of heads
+                  N = N,                                              # ◀ number of blocks
+                 )
     print(f"\nmodel parameters: {utils.utils.numberOfparameters(backbone)}")
     gpt = GPT(data_manager.tokenizer, backbone, B).to(device)
 
