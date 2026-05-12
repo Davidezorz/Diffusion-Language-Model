@@ -2,6 +2,11 @@
 .weights/
 lightning_logs/
 
+
+# markdown
+project.md
+
+
 # data
 .data/
 
