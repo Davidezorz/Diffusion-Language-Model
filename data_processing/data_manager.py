@@ -5,6 +5,7 @@ import os
 
 
 
+
 class DataManager():
     def __init__(self, caching_directory, n_processes: int = 1):
         if n_processes<=1: n_processes=1; print(f'using {n_processes} cpu')
@@ -102,16 +103,20 @@ class DataManager():
         return chunked_dataset
     
 
-    def getTrainloader(self, data, B):
+    def getTrainloader(self, data, B, sampler_cls=None):
+        shuffle = True if sampler_cls is None else False
+        sampler = None if sampler_cls is None else sampler_cls(data) 
+
         train_loader = torch.utils.data.DataLoader(
             data,
             batch_size=B,
             num_workers=self.n_processes,
             pin_memory=True,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=sampler,
             persistent_workers=True)
-        train_loader.tokenizer = self.tokenizer
         
+        train_loader.tokenizer = self.tokenizer
         return train_loader
 
 

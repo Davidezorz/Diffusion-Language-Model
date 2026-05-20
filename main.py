@@ -5,8 +5,9 @@ import datasets
 
 from data_processing.data_manager import DataManager
 import utils.utils
-from GPT_Lightning import GPT
+from gpt_lightning import GPT
 from models.AR import AR
+import data_processing.samplers as samplers
 
 
 
@@ -32,6 +33,7 @@ def main():
     process_tokens = data_manager.group_texts(tokens, T)
     process_tokens = process_tokens.with_format('torch')
 
+    # -------------------------------------------------------------------------
 
     print('\nexample')
     i = -1
@@ -58,7 +60,9 @@ def main():
     print(f"tot:   {tot}")
     print(f"p:     {n_pad/tot*100: .2f}%")
 
-    train_loader = data_manager.getTrainloader(process_tokens, B)
+
+    sampler_cls = samplers.RandomFaultTolerantSampler
+    train_loader = data_manager.getTrainloader(process_tokens, B, sampler_cls)
 
 
     print(f"\nTesting grainloader:")
@@ -103,6 +107,7 @@ def main():
     print('\nmodel testing:')
     gen = gpt.generate(torch.tensor([[1]], device=device), 200)
     print(gpt.tokenizer.decode(gen[0]))
+
 
 
 
