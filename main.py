@@ -5,8 +5,12 @@ import datasets
 
 from data_processing.data_manager import DataManager
 import utils.utils
-from gpt_lightning import GPT
+
 from models.AR import AR
+from gpt_lightning import GPT
+
+from models.DiT import DiT
+from diffusion_lightning import Diffusion
 import data_processing.samplers as samplers
 
 
@@ -61,6 +65,8 @@ def main():
     print(f"p:     {n_pad/tot*100: .2f}%")
 
 
+    # -------------------------------------------------------------------------
+    
     sampler_cls = samplers.RandomFaultTolerantSampler
     train_loader = data_manager.getTrainloader(process_tokens, B, sampler_cls)
 
@@ -74,17 +80,36 @@ def main():
         break
     
 
+    # -------------------------------------------------------------------------
+    """
     backbone = AR(V = len(data_manager.tokenizer),                    # ◀ vocabulary size
                   C = C,                                              # ◀ embedding dimension
                   H = H,                                              # ◀ number of heads
                   N = N,                                              # ◀ number of blocks
                  )
+    """
+    
+
+    backbone = DiT(V = len(data_manager.tokenizer),
+                   C = C,
+                   H = H, 
+                   cond_dim=32,
+                   N = N)
+
+        
     print(f"\nmodel parameters: {utils.utils.numberOfparameters(backbone)}")
-    gpt = GPT(data_manager.tokenizer, backbone, B).to(device)
+    """
+    model = GPT(backbone, data_manager.tokenizer, B).to(device)
+    """
+
+    model = Diffusion(backbone, data_manager.tokenizer, B=B, T=512).to(device)
+    print("\n\n")
+    print(f"Model noise device {model.noise.sigma_max.device}")
+
 
     print('\nmodel testing:')
-    gen = gpt.generate(torch.tensor([[1]], device=device), 20)
-    print(gpt.tokenizer.decode(gen[0]))
+    gen = model.generate(torch.tensor([[1]], device=device), 20)
+    print(model.tokenizer.decode(gen[0]))
 
 
     print("\ntraining:")
@@ -98,15 +123,19 @@ def main():
 
 
     trainer.fit(
-        model=gpt, 
+        model=model, 
         train_dataloaders=train_loader,
         val_dataloaders=train_loader
     )
     
-    gpt.to(device)
+    model.to(device)
     print('\nmodel testing:')
-    gen = gpt.generate(torch.tensor([[1]], device=device), 200)
-    print(gpt.tokenizer.decode(gen[0]))
+    """
+    gen = model.generate(torch.tensor([[1]], device=device), 200)
+    """
+    gen = model.generate(torch.tensor([[1]], device=device), 3)
+    print(model.tokenizer.decode(gen[0]))
+    
 
 
 

@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from models.AR import *
+from models.base_model import *
 
 
 """
@@ -32,7 +32,7 @@ class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
     """
-    def __init__(self, cond_dim, f_dim=256, max_period = 10_000):
+    def __init__(self, cond_dim, f_dim=256, max_period=10_000):
         super().__init__()
         self.FFN = nn.Sequential(
             nn.Linear(f_dim, cond_dim),
@@ -43,7 +43,7 @@ class TimestepEmbedder(nn.Module):
         self.f_dim = f_dim
 
         half = self.f_dim // 2
-        arange = torch.arange(0, half, dtype=torch.get_default_dtype())         # f_dim//2
+        arange = torch.arange(0, half, dtype=torch.float32)                     # f_dim//2
         freqs = torch.exp(- math.log(max_period)* arange / half )               # f_dim//2
         self.register_buffer('freqs', freqs)  
 
@@ -131,23 +131,23 @@ class DiTLastBlock(nn.Module):
 
 # ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
 # ╭───────────────────────────────────────────────────────────────────────────╮
-# │                                    DIT                                    │
+# │                                    DiT                                    │
 # ╰───────────────────────────────────────────────────────────────────────────╯
 # ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
 
-class DIT(AR):                     
-    def __init__(self, 
-                V: int,                                                         # ◀ vocabulary size
-                C: int = 128,                                                   # ◀ embedding dimension
-                H: int = 4,                                                     # ◀ number of heads
-                cond_dim: int = 32,                                             # ◀ internal dimension for conditioning
-                N: int = 3,                                                     # ◀ number of blocks
-                p: float = 0.1,                                                 # ◀ probability of dropout
-                name: str = 'DiT'                                               # ◀ name of the model
-                ):
-        super().__init__()
 
-        self.name = name
+class DiT(BaseModel):
+
+    def __init__(self, 
+                V:          int,                                                # ◀ vocabulary size
+                C:          int     = 128,                                      # ◀ embedding dimension
+                H:          int     = 4,                                        # ◀ number of heads
+                cond_dim:   int     = 32,                                       # ◀ internal dimension for conditioning
+                N:          int     = 3,                                        # ◀ number of blocks
+                p:          float   = 0.1,                                      # ◀ probability of dropout
+                name:       str     = 'DiT'                                     # ◀ name of the model
+                ):
+        super().__init__(name)
 
         self.embedding = EmbeddingLayer(C, V)
         self.sigma_map = TimestepEmbedder(cond_dim)
@@ -160,12 +160,14 @@ class DIT(AR):
 
 
     def forward(self, indices, sigma):
+        device_type = indices.device.type
+
         x = self.embedding(indices)
 
         conditioning = F.silu(self.sigma_map(sigma))
         rotary_cos_sin = self.rotary(x)
 
-        with torch.amp.autocast(dtype=torch.bfloat16):
+        with torch.amp.autocast(device_type, dtype=torch.bfloat16):
             for block in self.blocks:
                 x = block(x, rotary_cos_sin, conditioning, seqlens=None)
 

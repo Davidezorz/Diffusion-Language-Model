@@ -69,41 +69,39 @@ class Perplexity(NLL):
 
 class Diffusion(L.LightningModule):
     def __init__(self,
-                 config,
+                 backbone,
                  tokenizer: transformers.PreTrainedTokenizer,
-                 B = 16,
-                 T = 512,
-                 ):
-
+                 B:         int = 16,
+                 T:         int = 512
+                ):
         super().__init__()
-        self.config = config
         self.weights_folder = 'weights/' 
 
-        self.T = T
-        self.B = B
+        self.T          = T
+        self.B          = B
         self.tokenizer  = tokenizer
         self.V          = self.tokenizer.vocab_size
         self.mask_index = self.tokenizer.mask_token_id
         mask_token      = self.tokenizer.mask_token
         
-        if (not hasattr(self.tokenizer, 'mask_token') or mask_token is None): # ◀╮ Define the mask token
-            self.mask_index = self.V                                          #  │ if it is not already
-            self.V += 1                                                       #  ╰ defined
+        if (not hasattr(self.tokenizer, 'mask_token') or mask_token is None):   # ◀╮ Define the mask token
+            self.mask_index = self.V                                            #  │ if it is not already
+            self.V += 1                                                         #  ╰ defined
 
-        self.backbone = models.dit.DIT(self.config, vocab_size=self.V)        # ◀┬ Neural Network
-        self.backbone.load(folder=self.weights_folder)                        # ◀╯ initialization
+        self.backbone = backbone                                                # ◀┬ Neural Network
+        self.backbone.load(folder=self.weights_folder)                          # ◀╯ initialization
 
 
-        metrics = torchmetrics.MetricCollection({                             # ◀┬ Metrics 
-        'nll': NLL(),                                                         #  │ initialization 
-        'bpd': BPD(),                                                         #  │   
-        'ppl': Perplexity(),                                                  #  │ 
-        })                                                                    #  │
+        metrics = torchmetrics.MetricCollection({                               # ◀┬ Metrics 
+        'nll': NLL(),                                                           #  │ initialization 
+        'bpd': BPD(),                                                           #  │   
+        'ppl': Perplexity(),                                                    #  │ 
+        })                                                                      #  │
 
-        metrics.set_dtype(torch.float64)                                      #  │
-        self.train_metrics = metrics.clone(prefix='train/')                   #  │
-        self.valid_metrics = metrics.clone(prefix='val/')                     #  │ 
-        self.test_metrics  = metrics.clone(prefix='test/')                    #  ╯
+        metrics.set_dtype(torch.float32)                                        #  │ changed from float64 for MPS
+        self.train_metrics = metrics.clone(prefix='train/')                     #  │
+        self.valid_metrics = metrics.clone(prefix='val/')                       #  │ 
+        self.test_metrics  = metrics.clone(prefix='test/')                      #  ╯
 
         self.noise = noise_schedule.LogLinearNoise()
 
@@ -153,17 +151,16 @@ class Diffusion(L.LightningModule):
 
         self.train_metrics.update(losses.nlls, losses.token_mask)
 
-
         self.log_dict(  self.train_metrics,
                         on_step=False,
                         on_epoch=True,
                         sync_dist=True)
         
         self.log(name='trainer/loss',
-                value=loss.item(),        # The actual loss value
-                on_step=True,             # Log at each optimization step
-                on_epoch=False,           # Don't compute epoch average
-                sync_dist=True)           # Sync across all GPUs/nodes
+                value=loss.item(),                                              # The actual loss value
+                on_step=True,                                                   # Log at each optimization step
+                on_epoch=False,                                                 # Don't compute epoch average
+                sync_dist=True)                                                 # Sync across all GPUs/nodes
         return loss
     
 
@@ -258,9 +255,9 @@ class Diffusion(L.LightningModule):
     # ╭ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ╮
     # ╰ ─ sampling  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ╯
     @torch.no_grad()
-    def _sample(self, B = 4, num_steps=1000, eps=1e-5):
+    def _sample(self, device='cpu', B = 4, num_steps=1000, eps=1e-5):
         """Generate samples from the model."""
-        x = self._sample_prior(B, self.T)                                       # B T   of mask token
+        x = self._sample_prior(B, self.T, device=device)                        # B T   of mask token
 
         timesteps = torch.linspace(1, eps, num_steps + 1, device=self.device)   # ◀─┬ compute the timestes
         dt = (1 - eps) / num_steps                                              # ◀─╯ and delta timestap
@@ -292,16 +289,28 @@ class Diffusion(L.LightningModule):
         q_xs = log_p_x0.exp() * (move_chance_t - move_chance_s)                 # compute q_xs
         q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]                    # keep a token masked with probability move_chance_s[:, :, 0]
 
-        x_sample = _sample_categorical(q_xs)                                    # sampling
+        x_sample = _sample_categorical(q_xs, q_xs.device)                       # sampling
+
+
 
         not_masked = (x != self.mask_index).to(x.dtype)                         #  ╭ where the token are not masked         
+        print(f"DEVICE x_sample:   {x_sample.device}")
+        print(f"DEVICE not_masked: {not_masked.device}")
         return not_masked * x + (1 - not_masked) * x_sample                     # ◀╯ copy back
-    
+     
 
-    def _sample_prior(self, *batch_dims):
-        return self.mask_index * torch.ones(* batch_dims, dtype=torch.int64)    
+    def _sample_prior(self, *batch_dims, device):
+        return self.mask_index * torch.ones(* batch_dims, dtype=torch.int64,
+                                            device=device)    
 
 
-def _sample_categorical(categorical_probs):
-  gumbel_norm = ( 1e-10 - (torch.rand_like(categorical_probs) + 1e-10).log())
+    def generate(self, x, B = 4, num_steps=10, eps=1e-5):   # TODO: we should use x
+        return self._sample(device=x.device, B = B, num_steps=num_steps, 
+                            eps=eps)
+
+
+
+def _sample_categorical(categorical_probs, device):
+  gumbel_norm = ( 1e-10 - (torch.rand_like(categorical_probs, device=device) 
+                           + 1e-10).log())
   return (categorical_probs / gumbel_norm).argmax(dim=-1)

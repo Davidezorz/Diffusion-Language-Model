@@ -134,8 +134,11 @@ class LogLinearNoise(Noise):
     def __init__(self, eps=1e-3):
         super().__init__()
         self.eps = eps
-        self.sigma_max = self.total_noise(torch.tensor(1.0))
-        self.sigma_min = self.eps + self.total_noise(torch.tensor(0.0))
+        sigma_max = self.total_noise(torch.tensor(1.0))
+        sigma_min = self.eps + self.total_noise(torch.tensor(0.0))
+
+        self.register_buffer("sigma_max", sigma_max)
+        self.register_buffer("sigma_min", sigma_min)
 
     def rate_noise(self, t):
         return (1 - self.eps) / (1 - (1 - self.eps) * t)

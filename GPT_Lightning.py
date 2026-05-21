@@ -13,7 +13,7 @@ from transformers import AutoModelForCausalLM
 
 class  GPT(L.LightningModule):
 
-    def __init__(self, tokenizer, backbone, B, 
+    def __init__(self, backbone, tokenizer, B, 
                  gen_ppl_model_id='gpt2'):
         super().__init__()
         self.weights_folder = '.weights/'
