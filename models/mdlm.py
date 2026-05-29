@@ -23,6 +23,33 @@ LOG2 = math.log(2)
 ╰────────────────────────────────────────────────────────────────────────────────╯
 """
 
+"""
+Masked Diffusion Language Model (MDLM)
+
+This module implements the training and sampling logic for a masked discrete
+diffusion language model; in this file we:
+    1. Define the forward corruption process q(x_t | x_0)
+       - independent token masking, as in vanilla MDLM
+       - optional span masking, used as our modification
+       - optional position-dependent masking
+
+    2. Sample diffusion times t and convert them into noise levels sigma(t)
+
+    3. Call the neural denoiser backbone DiT:
+           DiT(x_t, sigma) -> logits over vocabulary
+
+    4. Apply the SUBS parameterization:
+       - the model cannot predict [MASK] as a clean token
+       - unmasked tokens are copied directly
+
+    5. Compute the continuous-time MDLM loss
+
+    6. Implement reverse diffusion sampling from an all-[MASK] prior
+
+What's different wrt DiT.py:
+    - this file defines the probabilistic diffusion process and training logic
+    - DiT.py defines the neural network p_theta(x_0 | x_t, t) (backward process)
+"""
 
 # ╭──────────────────────────────────────────────────────────────────────────────╮
 # │                                     Loss                                     │
@@ -56,7 +83,7 @@ class Perplexity(NLL):
 # ╰──────────────────────────────────────────────────────────────────────────────╯
 # ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
 
-class Diffusion(L.LightningModule):
+class MaskedDiffusionLM(L.LightningModule):
     def __init__(self,
                  config,
                  tokenizer: transformers.PreTrainedTokenizer,
