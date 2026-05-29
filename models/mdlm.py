@@ -197,6 +197,15 @@ class MaskedDiffusionLM(L.LightningModule):
         losses = self._loss(batch['input_ids'], attention_mask)
         loss = losses.loss
 
+        if not hasattr(self, "_running_losses"):
+            self._running_losses = []
+
+        self._running_losses.append(loss.item())
+
+        if batch_idx % 10 == 0:
+            avg10 = sum(self._running_losses[-10:]) / min(10, len(self._running_losses))
+            print(f"[{self.corruption_type}] batch={batch_idx:03d} loss={loss.item():.4f} avg10={avg10:.4f}")
+
         self.train_metrics.update(losses.nlls, losses.token_mask)
 
         self.log_dict(self.train_metrics,
@@ -362,22 +371,23 @@ class MaskedDiffusionLM(L.LightningModule):
             device=device
         )
 
-        weights = 1 + self.position_gamma * positions
+        # keep the average corruption closer to the vanilla for the same t -> center weigts in 1
+        weights = 1 + self.position_gamma * (positions - 0.5)
+        weights = weights.clamp_min(1e-3)
 
-        alpha = (1 - t[:, None]).clamp_min(1e-5) ** weights[None, :]
+        base = (1 - t[:, None]).clamp_min(1e-5)
+
+        alpha = base ** weights[None, :]
 
         move_chance = 1 - alpha
 
         if self.position_loss_weighting:
-            # lambda_{t,l} = - alpha'_{t,l} / (1 - alpha_{t,l})
             loss_weight = (
                     weights[None, :]
-                    * (1 - t[:, None]).clamp_min(1e-5) ** (weights[None, :] - 1)
+                    * base ** (weights[None, :] - 1)
                     / (1 - alpha).clamp_min(1e-5)
             )
         else:
-            # simpler experimental version:
-            # use scalar vanilla MDLM weighting
             sigma, dsigma = self.noise(t)
             loss_weight = (dsigma / torch.expm1(sigma))[:, None]
 

@@ -32,11 +32,11 @@ def run_smoke(corruption_type):
     )
 
     model.corruption_type = corruption_type
-    model.position_gamma = 2.0
+    model.position_gamma = 0.5
 
     trainer = L.Trainer(
         max_epochs=1,
-        limit_train_batches=20,
+        limit_train_batches=100,
         limit_val_batches=0,
         accelerator="auto",
         devices=1,
