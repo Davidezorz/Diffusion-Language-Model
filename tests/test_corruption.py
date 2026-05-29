@@ -317,3 +317,27 @@ def test_position_noise_gamma_zero_is_uniform():
     print("gamma=0 right:", right_mask_rate)
 
     assert abs(right_mask_rate - left_mask_rate) < 0.08
+
+
+def test_position_noise_average_mask_rate_balanced():
+
+    model = create_model()
+    model.corruption_type = "position"
+    model.position_gamma = 0.2
+
+    B = 512
+    T = 100
+
+    t = torch.tensor([0.5] * B)
+
+    move_chance, _ = model.position_dependent_noise(
+        t=t,
+        T=T,
+        device=t.device
+    )
+
+    avg_mask_rate = move_chance.mean().item()
+
+    print("position avg mask rate:", avg_mask_rate)
+
+    assert abs(avg_mask_rate - 0.5) < 0.03
