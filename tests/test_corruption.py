@@ -2,7 +2,7 @@ import torch
 
 from types import SimpleNamespace
 from transformers import AutoTokenizer
-from models.Diffusion import Diffusion
+from models.mdlm import MaskedDiffusionLM
 from data_processing.data_manager import DataManager
 import models.noise_schedule
 
@@ -17,7 +17,7 @@ class DummyDIT:
 
 
 models.dit = SimpleNamespace(
-    DIT=DummyDIT
+    DiT=DummyDIT
 )
 
 class DummyBackbone:
@@ -39,7 +39,7 @@ def create_model():
 
     tokenizer = data_manager.tokenizer
 
-    model = Diffusion(
+    model = MaskedDiffusionLM(
         config=config,
         tokenizer=tokenizer,
         B=16,
@@ -221,3 +221,99 @@ def test_span_creates_contiguous_blocks():
         print("Avg independent segments:", avg_ind_segments)
 
         assert avg_span_segments < avg_ind_segments
+
+def test_position_noise_shapes():
+
+    model = create_model()
+    model.corruption_type = "position"
+    model.position_gamma = 2.0
+
+    B = 8
+    T = 100
+
+    t = torch.tensor([0.5] * B)
+
+    move_chance, loss_weight = model.position_dependent_noise(
+        t=t,
+        T=T,
+        device=t.device
+    )
+
+    assert move_chance.shape == (B, T)
+    assert loss_weight.shape in [(B, T), (B, 1)]
+
+    assert torch.isfinite(move_chance).all()
+    assert torch.isfinite(loss_weight).all()
+
+    assert (move_chance >= 0).all()
+    assert (move_chance <= 1).all()
+
+def test_position_noise_masks_more_on_right():
+
+    model = create_model()
+    model.corruption_type = "position"
+    model.position_gamma = 2.0
+
+    B = 512
+    T = 100
+
+    x = torch.randint(
+        0,
+        100,
+        (B, T)
+    )
+
+    t = torch.tensor([0.5] * B)
+
+    move_chance, _ = model.position_dependent_noise(
+        t=t,
+        T=T,
+        device=x.device
+    )
+
+    xt = model.q_xt(x, move_chance)
+
+    mask = xt == model.mask_index
+
+    left_mask_rate = mask[:, :T//3].float().mean().item()
+    right_mask_rate = mask[:, -T//3:].float().mean().item()
+
+    print("left mask rate:", left_mask_rate)
+    print("right mask rate:", right_mask_rate)
+
+    assert right_mask_rate > left_mask_rate
+
+def test_position_noise_gamma_zero_is_uniform():
+
+    model = create_model()
+    model.corruption_type = "position"
+    model.position_gamma = 0.0
+
+    B = 512
+    T = 100
+
+    x = torch.randint(
+        0,
+        100,
+        (B, T)
+    )
+
+    t = torch.tensor([0.5] * B)
+
+    move_chance, _ = model.position_dependent_noise(
+        t=t,
+        T=T,
+        device=x.device
+    )
+
+    xt = model.q_xt(x, move_chance)
+
+    mask = xt == model.mask_index
+
+    left_mask_rate = mask[:, :T//3].float().mean().item()
+    right_mask_rate = mask[:, -T//3:].float().mean().item()
+
+    print("gamma=0 left:", left_mask_rate)
+    print("gamma=0 right:", right_mask_rate)
+
+    assert abs(right_mask_rate - left_mask_rate) < 0.08

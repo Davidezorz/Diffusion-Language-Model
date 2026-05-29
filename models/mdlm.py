@@ -271,22 +271,25 @@ class MaskedDiffusionLM(L.LightningModule):
         t = (1 - self.sampling_eps) * sample + self.sampling_eps
         return t
 
-
     def q_xt(self, x, p):
         """
-        to compute noisy sample x_t given:
+        Compute noisy sample x_t.
 
         x : (B,T) clean tokens
-        p : (B,1) masking probability
+        p : (B,1) or (B,T) masking probability
         """
 
-        # base model corruption
         if self.corruption_type == "independent":
             return self.q_xt_independent(x, p)
 
-        # alternative corruption
         elif self.corruption_type == "span":
-            return self.q_xt_span(x, p)
+            return self.q_xt_span(x, p, max_span=self.max_span)
+
+        # since q_xt_independent is equipped of using p as:
+        # - different for every position
+        # - independent bernoulli using p
+        elif self.corruption_type == "position":
+            return self.q_xt_independent(x, p)
 
         else:
             raise ValueError(
