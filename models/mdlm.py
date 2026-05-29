@@ -8,8 +8,9 @@ import torchmetrics
 import transformers
 
 import data_processing as dataloader
-import models
+from data_processing.samplers import RandomFaultTolerantSampler
 import models.noise_schedule as noise_schedule
+from models.DiT import DiT
 
 LOG2 = math.log(2)
 
@@ -97,7 +98,7 @@ class MaskedDiffusionLM(L.LightningModule):
 
         self.T = T
         self.tokenizer = tokenizer
-        self.V = self.tokenizer.vocab_size
+        self.V = len(self.tokenizer)
         self.mask_index = self.tokenizer.mask_token_id
         mask_token = self.tokenizer.mask_token
 
@@ -110,7 +111,7 @@ class MaskedDiffusionLM(L.LightningModule):
 
         # DiT is the neural denoising model
         # It receives corrupted tokens x_t and noise level sigma, and returns vocabulary logits for predicting x_0
-        self.denoiser = models.dit.DiT(self.config, vocab_size=self.V)
+        self.denoiser = self.denoiser = DiT(V=self.V)
         self.denoiser.load(folder=self.weights_folder)
 
         metrics = torchmetrics.MetricCollection({  # ◀┬ Metrics
@@ -164,7 +165,7 @@ class MaskedDiffusionLM(L.LightningModule):
         return [optimizer], [scheduler_dict]
 
     def on_train_start(self):
-        sampler_cls = dataloader.RandomFaultTolerantSampler
+        sampler_cls = RandomFaultTolerantSampler
         updated_dls = []
         for dl in self.trainer.fit_loop._combined_loader.flattened:
             if hasattr(dl.sampler, 'shuffle'):
