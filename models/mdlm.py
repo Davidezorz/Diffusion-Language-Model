@@ -105,8 +105,13 @@ class MaskedDiffusionLM(L.LightningModule):
             self.mask_index = self.V  # │ if it is not already
             self.V += 1  # ╰ defined
 
-        self.backbone = models.dit.DIT(self.config, vocab_size=self.V)  # ◀┬ Neural Network
-        self.backbone.load(folder=self.weights_folder)  # ◀╯ initialization
+        self.B = B
+        self.antithetic_sampling = False
+
+        # DiT is the neural denoising model
+        # It receives corrupted tokens x_t and noise level sigma, and returns vocabulary logits for predicting x_0
+        self.denoiser = models.dit.DiT(self.config, vocab_size=self.V)
+        self.denoiser.load(folder=self.weights_folder)
 
         metrics = torchmetrics.MetricCollection({  # ◀┬ Metrics
             'nll': NLL(),  # │ initialization
@@ -129,12 +134,17 @@ class MaskedDiffusionLM(L.LightningModule):
         self.fast_forward_epochs = None
         self.fast_forward_batches = None
 
-        # toggle for the type of corruption (later, span)
-        self.corruption_type = "independent" # "span"
+        # toggle for the type of corruption (later, span and position)
+        self.corruption_type = "independent"  # "independent", "span", "position"
+        self.max_span = 5
+
+        # position-dependent noising
+        self.position_gamma = 2.0
+        self.position_loss_weighting = False
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
-            self.backbone.parameters(),
+            self.denoiser.parameters(),
             lr=3e-4,
             betas=(0.9, 0.999),
             eps=1e-8,
@@ -175,8 +185,10 @@ class MaskedDiffusionLM(L.LightningModule):
             )
         self.trainer.fit_loop._combined_loader.flattened = updated_dls
 
+
     def optimizer_step(self, *args, **kwargs):
         super().optimizer_step(*args, **kwargs)
+
 
     def training_step(self, batch, batch_idx):
         attention_mask = batch['attention_mask'] if 'attention_mask' in batch else None
@@ -198,6 +210,7 @@ class MaskedDiffusionLM(L.LightningModule):
                  sync_dist=True)  # Sync across all GPUs/nodes
         return loss
 
+
     def _loss(self, x0, attention_mask):
         B, T = x0.shape
 
@@ -218,12 +231,22 @@ class MaskedDiffusionLM(L.LightningModule):
                     nlls=nlls,
                     token_mask=attention_mask)
 
+
     def _forward_pass_diffusion(self, x0):
         B, T = x0.shape
         t = self._sample_t(B, x0.device)
 
         sigma, dsigma = self.noise(t)
-        move_chance = 1 - torch.exp(-sigma[:, None])
+
+        if self.corruption_type == "position":
+            move_chance, loss_weight = self.position_dependent_noise(
+                t=t,
+                T=T,
+                device=x0.device
+            )
+        else:
+            move_chance = 1 - torch.exp(-sigma[:, None])
+            loss_weight = (dsigma / torch.expm1(sigma))[:, None]
 
         xt = self.q_xt(x0, move_chance)
 
@@ -235,7 +258,8 @@ class MaskedDiffusionLM(L.LightningModule):
             dim=-1,
             index=x0[:, :, None]).squeeze(-1)
 
-        return - log_p_theta * (dsigma / torch.expm1(sigma))[:, None]
+        return - log_p_theta * loss_weight
+
 
     def _sample_t(self, B, device):
         sample = torch.rand(B, device=device)
@@ -246,6 +270,7 @@ class MaskedDiffusionLM(L.LightningModule):
 
         t = (1 - self.sampling_eps) * sample + self.sampling_eps
         return t
+
 
     def q_xt(self, x, p):
         """
@@ -272,14 +297,7 @@ class MaskedDiffusionLM(L.LightningModule):
     # base paper corruption
     def q_xt_independent(self, x, p):
         move_indices = torch.rand(*x.shape, device=x.device) < p
-
-        xt = torch.where(
-            move_indices,
-            self.mask_index,
-            x
-        )
-
-        return xt
+        return torch.where(move_indices, self.mask_index, x)
 
     # span corruption
     def q_xt_span(self, x, p, max_span=5):
@@ -321,13 +339,52 @@ class MaskedDiffusionLM(L.LightningModule):
 
         return xt
 
+    def position_dependent_noise(self, t, T, device):
+        """
+        Right-to-left noising:
+            - Left positions have lower masking probability
+            - Right positions have higher masking probability
+
+        alpha_{t,l} = (1 - t)^{w_l}
+        p_mask(t,l) = 1 - alpha_{t,l}
+        """
+
+        B = t.shape[0]
+
+        positions = torch.linspace(
+            0,
+            1,
+            T,
+            device=device
+        )
+
+        weights = 1 + self.position_gamma * positions
+
+        alpha = (1 - t[:, None]).clamp_min(1e-5) ** weights[None, :]
+
+        move_chance = 1 - alpha
+
+        if self.position_loss_weighting:
+            # lambda_{t,l} = - alpha'_{t,l} / (1 - alpha_{t,l})
+            loss_weight = (
+                    weights[None, :]
+                    * (1 - t[:, None]).clamp_min(1e-5) ** (weights[None, :] - 1)
+                    / (1 - alpha).clamp_min(1e-5)
+            )
+        else:
+            # simpler experimental version:
+            # use scalar vanilla MDLM weighting
+            sigma, dsigma = self.noise(t)
+            loss_weight = (dsigma / torch.expm1(sigma))[:, None]
+
+        return move_chance, loss_weight
 
     def forward(self, x, sigma):
         """Returns log score."""
         if sigma.ndim > 1:
             sigma = sigma.squeeze(-1)
 
-        logits = self.backbone(x, sigma)
+        logits = self.denoiser(x, sigma)
 
         return self._subs_parameterization(logits=logits, xt=x)
 
