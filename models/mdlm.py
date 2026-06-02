@@ -372,6 +372,7 @@ class MaskedDiffusionLM(L.LightningModule):
         )
 
         # keep the average corruption closer to the vanilla for the same t -> center weigts in 1
+        # w_l=1+gamma(p_t-0.5)
         weights = 1 + self.position_gamma * (positions - 0.5)
         weights = weights.clamp_min(1e-3)
 
