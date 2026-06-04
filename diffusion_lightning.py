@@ -47,10 +47,12 @@ class NLL(torchmetrics.aggregation.MeanMetric):
     pass
     
 
+
 class BPD(NLL):
     def compute(self) -> torch.Tensor:
         """Computes the bits per dimension."""
         return self.mean_value / self.weight / LOG2
+
 
 
 class Perplexity(NLL):
@@ -71,14 +73,12 @@ class Diffusion(L.LightningModule):
     def __init__(self,
                  backbone,
                  tokenizer: transformers.PreTrainedTokenizer,
-                 B:         int = 16,
                  T:         int = 512
                 ):
         super().__init__()
         self.weights_folder = 'weights/' 
 
         self.T          = T
-        self.B          = B
         self.tokenizer  = tokenizer
         self.V          = self.tokenizer.vocab_size
         self.mask_index = self.tokenizer.mask_token_id
@@ -90,7 +90,6 @@ class Diffusion(L.LightningModule):
 
         self.backbone = backbone                                                # ◀┬ Neural Network
         self.backbone.load(folder=self.weights_folder)                          # ◀╯ initialization
-
 
         metrics = torchmetrics.MetricCollection({                               # ◀┬ Metrics 
         'nll': NLL(),                                                           #  │ initialization 
@@ -114,6 +113,22 @@ class Diffusion(L.LightningModule):
         self.fast_forward_batches = None
 
         self.antithetic_sampling = True
+
+
+    def on_save_checkpoint(self, checkpoint):
+        if hasattr(self.trainer.train_dataloader.sampler, 'state_dict'):
+            checkpoint['sampler_state'] = self.trainer.train_dataloader.sampler.state_dict()
+
+
+    def on_load_checkpoint(self, checkpoint):
+        if 'sampler_state' in checkpoint:
+            self.saved_sampler_state = checkpoint['sampler_state']
+
+
+    def on_train_start(self):
+        if hasattr(self, 'saved_sampler_state'):
+            self.trainer.train_dataloader.sampler.load_state_dict(self.saved_sampler_state)
+            del self.saved_sampler_state
 
 
     def configure_optimizers(self):
@@ -216,7 +231,6 @@ class Diffusion(L.LightningModule):
         return t
     
 
-
     def q_xt(self, x, p):
         """Computes the noisy sample xt """
         move_indices = torch.rand(* x.shape, device=x.device) < p
@@ -255,9 +269,9 @@ class Diffusion(L.LightningModule):
     # ╭ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ╮
     # ╰ ─ sampling  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ╯
     @torch.no_grad()
-    def _sample(self, device='cpu', B = 4, num_steps=1000, eps=1e-5):
+    def _sample(self, B = 4, num_steps=1000, eps=1e-5):
         """Generate samples from the model."""
-        x = self._sample_prior(B, self.T, device=device)                        # B T   of mask token
+        x = self._sample_prior(B, self.T)                                       # B T   of mask token
 
         timesteps = torch.linspace(1, eps, num_steps + 1, device=self.device)   # ◀─┬ compute the timestes
         dt = (1 - eps) / num_steps                                              # ◀─╯ and delta timestap
@@ -268,8 +282,8 @@ class Diffusion(L.LightningModule):
             x = self._ddpm_update(x, t, dt)                                     #  ╯
 
         t = timesteps[-1] * torch.ones(x.shape[0], 1, device=self.device)       # ◀─┬ last step, remove all noise 
-        x = self.forward(x, self.noise(t)[0]).argmax(dim=-1)                    # ◀─╯ by taking the argmax
-        return x 
+        outputs = self.forward(x, self.noise(t)[0]).argmax(dim=-1)                    # ◀─╯ by taking the argmax
+        return outputs 
 
 
     def _ddpm_update(self, x, t, dt):                    
@@ -291,22 +305,18 @@ class Diffusion(L.LightningModule):
 
         x_sample = _sample_categorical(q_xs, q_xs.device)                       # sampling
 
-
-
         not_masked = (x != self.mask_index).to(x.dtype)                         #  ╭ where the token are not masked         
-        print(f"DEVICE x_sample:   {x_sample.device}")
-        print(f"DEVICE not_masked: {not_masked.device}")
         return not_masked * x + (1 - not_masked) * x_sample                     # ◀╯ copy back
      
 
-    def _sample_prior(self, *batch_dims, device):
+    def _sample_prior(self, *batch_dims):
         return self.mask_index * torch.ones(* batch_dims, dtype=torch.int64,
-                                            device=device)    
+                                            device=self.device)    
 
 
-    def generate(self, x, B = 4, num_steps=10, eps=1e-5):   # TODO: we should use x
-        return self._sample(device=x.device, B = B, num_steps=num_steps, 
-                            eps=eps)
+    def generate(self, ids, n_tokens=10, num_steps=10, eps=1e-5):   # TODO: we should use ids
+        B, T = ids.shape
+        return self._sample(B = B, num_steps=num_steps, eps=eps)[:, :n_tokens]
 
 
 

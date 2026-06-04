@@ -54,8 +54,8 @@ class Rotary(torch.nn.Module):
             freqs = torch.einsum("i,j->ij", t, self.inv_freq.clone())           # T c//2, first row is t[0]*inv_freq
             emb = torch.cat((freqs, freqs), dim=-1)                             # T c
 
-            self.cos = repeat(emb.cos(), 'T c -> 1 T 3 1 c')                    # 1 T 3 1 c
-            self.sin = repeat(emb.sin(), 'T c -> 1 T 3 1 c')                    # 1 T 3 1 c
+            self.cos = repeat(emb.cos(), 'T c -> 1 T 3 1 c').contiguous()       # 1 T 3 1 c
+            self.sin = repeat(emb.sin(), 'T c -> 1 T 3 1 c').contiguous()       # 1 T 3 1 c
             
             self.cos[:,:,2,:,:].fill_(1.)                                       # ◀─┬ This makes the transformation 
             self.sin[:,:,2,:,:].fill_(0.)                                       # ◀─╯ on values an identity
@@ -102,13 +102,13 @@ class LayerNorm(nn.Module):
     def __init__(self, C):
         super().__init__()
         self.scale = nn.Parameter(torch.ones([C]))
-        self.bias  = nn.Parameter(torch.zeros([C]))
+        # self.bias  = nn.Parameter(torch.zeros([C]))
         self.C     = C
     
     
     def forward(self, x):
         x = F.layer_norm(x.float(), [self.C])
-        return x * self.scale[None, None, :] + self.bias[None, None, :]
+        return x * self.scale[None, None, :] #+ self.bias[None, None, :]
 
 
 
@@ -131,7 +131,7 @@ class MultiHeadAttention(nn.Module):
         self.c         = int(C // H)
         
         self.W_qkv     = nn.Linear(C, 3 * C, bias=False)
-        self.W_o       = nn.Linear(C, C) 
+        self.W_o       = nn.Linear(C,     C, bias=False) 
         self.dropout   = nn.Dropout(p_dropout)
 
         # attention function choice
@@ -265,16 +265,16 @@ class MultiHeadAttention(nn.Module):
 # ╰───────────────────────────────────────────────────────────────────────────╯
 
 class FeedForward(nn.Module):
-    def __init__(self, C: int = 64, factor: int = 4):
+    def __init__(self, C: int = 64, factor: int = 1.5):
         super().__init__()
-        self.FFN = nn.Sequential(
-            nn.Linear(C, factor*C),
-            nn.GELU(approximate='tanh'),
-            nn.Linear(factor*C, C)
-        )
+        self.Wi  = nn.Linear(C, 2 * int(factor * C), bias=False) 
+        self.Wo  = nn.Linear(int(factor * C),     C, bias=False)
+        self.act = nn.GELU(approximate='none')
     
-    def forward(self, x):
-        return self.FFN(x)
+    def forward(self, x):                                                                                                  
+        x = self.Wi(x)                                                          # Pass through first layer
+        x1, x2 = x.chunk(2, dim=-1)                                             # Split the tensor in half along the last dimension
+        return self.Wo(self.act(x1) * x2)                                       # Multiply the activated half by the linear half (the "Gate")
 
 
 
@@ -312,18 +312,16 @@ class Block(nn.Module):
 class LastBlock(nn.Module):
     def __init__(self, C, V):
         super().__init__()
-        self.norm   = LayerNorm(C)
-
-        self.linear = nn.Linear(C, V)
-        self.linear.weight.data.zero_()
-        self.linear.bias.data.zero_()
+        self.dense = nn.Linear(C, C, bias=False)
+        self.act   = nn.GELU(approximate='none')
+        self.norm  = LayerNorm(C)
+        
+        self.linear = nn.Linear(C, V, bias=True)
 
     def forward(self, x):
-        x = self.linear(self.norm(x))
-        return x
-  
-
-
+        x = self.norm(self.act(self.dense(x)))
+        logits = self.linear(x)
+        return logits
 
 
 # ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬

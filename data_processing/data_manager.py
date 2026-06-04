@@ -7,13 +7,15 @@ import os
 
 
 class DataManager():
-    def __init__(self, caching_directory, n_processes: int = 1):
+    def __init__(self, caching_directory, tokenizer, n_processes: int = 1):
         if n_processes<=1: n_processes=1; print(f'using {n_processes} cpu')
 
         self.caching_directory = caching_directory
-        self.tokenizer = AutoTokenizer.from_pretrained('gpt2')
-        self.EOS = self.tokenizer.encode(self.tokenizer.eos_token)[0]
-        self.BOS = self.tokenizer.encode(self.tokenizer.bos_token)[0]
+        self.tokenizer = tokenizer
+        self.EOS = self.tokenizer.encode(self.tokenizer.eos_token, 
+                                         add_special_tokens=False)[0]
+        self.BOS = self.tokenizer.encode(self.tokenizer.bos_token, 
+                                         add_special_tokens=False)[0]
         self.n_processes = n_processes
 
         if self.tokenizer.pad_token is None:
