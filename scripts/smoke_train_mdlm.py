@@ -6,6 +6,7 @@ import datasets
 from data_processing.data_manager import DataManager
 from models.mdlm import MaskedDiffusionLM
 
+torch.set_float32_matmul_precision("high")
 
 def run_smoke(corruption_type, gamma=0.2):
     caching_directory = ".data/"
@@ -27,9 +28,31 @@ def run_smoke(corruption_type, gamma=0.2):
 
     tokens = dm.tokenize(dataset["train"])
     data = dm.group_texts(tokens, T)
-    data = data.with_format("torch")
 
-    loader = dm.getTrainloader(data, B)
+    def collate_fn(batch):
+        input_ids = torch.tensor(
+            [item["input_ids"] for item in batch],
+            dtype=torch.long
+        )
+
+        attention_mask = torch.tensor(
+            [item["attention_mask"] for item in batch],
+            dtype=torch.long
+        )
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+
+    loader = torch.utils.data.DataLoader(
+        data,
+        batch_size=B,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
 
     model = MaskedDiffusionLM(
         config=None,

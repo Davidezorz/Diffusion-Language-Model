@@ -84,6 +84,9 @@ class Perplexity(NLL):
 # ╰──────────────────────────────────────────────────────────────────────────────╯
 # ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
 
+
+
+
 class MaskedDiffusionLM(L.LightningModule):
     def __init__(self,
                  config,
@@ -178,23 +181,64 @@ class MaskedDiffusionLM(L.LightningModule):
                 torch.utils.data.DataLoader(
                     dl.dataset,
                     batch_size=self.B,
-                    num_workers=8,  # ◀◀◀◀◀ TODO: should be a variable
+                    num_workers=0,  # ◀◀◀◀◀ TODO: should be a variable
                     pin_memory=True,
                     sampler=dl_sampler,
                     shuffle=False,
-                    persistent_workers=True)
+                    persistent_workers=False)
             )
         self.trainer.fit_loop._combined_loader.flattened = updated_dls
 
-
+    
     def optimizer_step(self, *args, **kwargs):
         super().optimizer_step(*args, **kwargs)
 
+    def _ensure_batch_tensor(self, x):
+        """
+        Converts possible batch formats to a tensor of shape (B, T).
+
+        Handles:
+        - Tensor already shaped (B, T)
+        - list of lists
+        - list of tensors shaped (T,)
+        - transposed list of tensors shaped (B,)
+        """
+
+        if isinstance(x, torch.Tensor):
+            return x.to(self.device)
+
+        if isinstance(x, list):
+            if isinstance(x[0], torch.Tensor):
+                x = torch.stack(x)
+
+                # If shape is (T, B), transpose to (B, T)
+                if x.ndim == 2 and x.shape[0] != self.B and x.shape[1] == self.B:
+                    x = x.T
+
+                return x.to(self.device)
+
+            x = torch.tensor(
+                x,
+                dtype=torch.long,
+                device=self.device
+            )
+
+            return x
+
+        raise TypeError(f"Unsupported batch type: {type(x)}")
+    
+
 
     def training_step(self, batch, batch_idx):
-        attention_mask = batch['attention_mask'] if 'attention_mask' in batch else None
 
-        losses = self._loss(batch['input_ids'], attention_mask)
+        input_ids = self._ensure_batch_tensor(batch["input_ids"])
+
+        attention_mask = batch["attention_mask"] if "attention_mask" in batch else None
+
+        if attention_mask is not None:
+            attention_mask = self._ensure_batch_tensor(attention_mask)
+
+        losses = self._loss(input_ids, attention_mask)
         loss = losses.loss
 
         if not hasattr(self, "_running_losses"):
@@ -204,20 +248,30 @@ class MaskedDiffusionLM(L.LightningModule):
 
         if batch_idx % 10 == 0:
             avg10 = sum(self._running_losses[-10:]) / min(10, len(self._running_losses))
-            print(f"[{self.corruption_type}] batch={batch_idx:03d} loss={loss.item():.4f} avg10={avg10:.4f}")
+            print(
+                f"[{self.corruption_type}] "
+                f"batch={batch_idx:03d} "
+                f"loss={loss.item():.4f} "
+                f"avg10={avg10:.4f}"
+            )
 
         self.train_metrics.update(losses.nlls, losses.token_mask)
 
-        self.log_dict(self.train_metrics,
-                      on_step=False,
-                      on_epoch=True,
-                      sync_dist=True)
+        self.log_dict(
+            self.train_metrics,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True
+        )
 
-        self.log(name='trainer/loss',
-                 value=loss.item(),  # The actual loss value
-                 on_step=True,  # Log at each optimization step
-                 on_epoch=False,  # Don't compute epoch average
-                 sync_dist=True)  # Sync across all GPUs/nodes
+        self.log(
+            name="trainer/loss",
+            value=loss.item(),
+            on_step=True,
+            on_epoch=False,
+            sync_dist=True
+        )
+
         return loss
 
 
