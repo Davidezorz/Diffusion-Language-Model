@@ -52,7 +52,7 @@ class DataManagerPreTrain():
             num_proc=self.n_processes,
             remove_columns=["text"],
             desc="Tokenizing",
-            load_from_cache_file=True,
+            load_from_cache_file=False,
             cache_file_name=cache_file 
         )
         return tokenized_dataset
@@ -100,7 +100,7 @@ class DataManagerPreTrain():
             group_texts,
             batched=True,
             num_proc=self.n_processes,
-            load_from_cache_file=True,
+            load_from_cache_file=False,
             cache_file_name=cache_file, 
             desc='Grouping'
         )

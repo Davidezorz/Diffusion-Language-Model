@@ -15,9 +15,9 @@ def make_toy_dataset(n=512):
     texts = []
     patterns = [
         "the cat sat on the mat .",
-        "the dog ran in the park .",
-        "alice likes red apples .",
-        "bob likes blue cars ."
+        "the dog is running in the park .",
+        "he is going to school by bus .",
+        "university sucks big time ."
     ]
 
     for i in range(n):
@@ -31,10 +31,10 @@ def reconstruction_test(model, dm, device):
     model.eval()
 
     texts = [
-        "the cat sat on the mat .",
-        "the dog ran in the park .",
-        "alice likes red apples .",
-        "bob likes blue cars .",
+        "the cat sat on the mat.",
+        "the dog is running in the park .",
+        "he is going to school by bus .",
+        "university sucks big time ."
     ]
 
     enc = dm.tokenizer(
@@ -42,41 +42,47 @@ def reconstruction_test(model, dm, device):
         return_tensors="pt",
         padding=True,
         truncation=True,
-        max_length=32,
+        max_length=16,
         add_special_tokens=False,
     )
 
-    input_ids = enc["input_ids"].to(device)
-    clean = input_ids.clone()
+    x0 = enc["input_ids"].to(device)
+    attention_mask = enc["attention_mask"].to(device).bool()
 
-    mask_id = dm.tokenizer.mask_token_id
-
-    # mask 50% of non-pad tokens
     pad_id = dm.tokenizer.pad_token_id
-    valid = input_ids != pad_id
-    rand = torch.rand(input_ids.shape, device=device)
-    mask = (rand < 0.5) & valid
+    valid = attention_mask & (x0 != pad_id)
 
-    corrupted = input_ids.clone()
-    corrupted[mask] = mask_id
+    token_mask = torch.zeros_like(x0, dtype=torch.bool)
+
+    for b in range(x0.shape[0]):
+        valid_positions = torch.where(valid[b])[0]
+        pos = valid_positions[len(valid_positions) // 2]
+        token_mask[b, pos] = True
+
+    xt = x0.clone()
+    xt[token_mask] = model.mask_index
 
     with torch.no_grad():
-        sigma = torch.ones(input_ids.shape[0], device=device) * 0.5
-        logits = model(corrupted, sigma=sigma)
-        pred = logits.argmax(dim=-1)
+        sigma = torch.ones(x0.shape[0], device=device) * 0.5
+        log_probs = model(xt, sigma=sigma)
+        pred = log_probs.argmax(dim=-1)
 
-    reconstructed = corrupted.clone()
-    reconstructed[mask] = pred[mask]
+    reconstructed = xt.clone()
+    reconstructed[token_mask] = pred[token_mask]
 
-    for i in range(len(texts)):
-        print("\nCLEAN:")
-        print(dm.tokenizer.decode(clean[i], skip_special_tokens=True))
+    print("\nCLEAN:")
+    print(dm.tokenizer.decode(x0[0], skip_special_tokens=True))
 
-        print("CORRUPTED:")
-        print(dm.tokenizer.decode(corrupted[i], skip_special_tokens=False))
+    print("CORRUPTED:")
+    print(dm.tokenizer.decode(xt[0], skip_special_tokens=False))
 
-        print("RECONSTRUCTED:")
-        print(dm.tokenizer.decode(reconstructed[i], skip_special_tokens=True))
+    print("RECONSTRUCTED:")
+    print(dm.tokenizer.decode(reconstructed[0], skip_special_tokens=True))
+
+    print("target ids:", x0[token_mask].tolist())
+    print("pred ids:  ", pred[token_mask].tolist())
+    print("target:", dm.tokenizer.decode(x0[token_mask]))
+    print("pred:  ", dm.tokenizer.decode(pred[token_mask]))
 
 
 def run_smoke(corruption_type, gamma=0.2):
@@ -151,7 +157,7 @@ def run_smoke(corruption_type, gamma=0.2):
         print("Running on CPU")
 
     trainer = L.Trainer(
-        max_epochs=50,
+        max_epochs=10,
         limit_train_batches=100,
         accelerator=accelerator,
         devices=1,

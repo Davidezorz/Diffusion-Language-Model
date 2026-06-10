@@ -149,14 +149,14 @@ class MaskedDiffusionLM(L.LightningModule):
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
             self.denoiser.parameters(),
-            lr=3e-4,
+            lr=1e-3,
             betas=(0.9, 0.999),
             eps=1e-8,
             weight_decay=0)
 
         scheduler = transformers.get_constant_schedule_with_warmup(
             optimizer=optimizer,
-            num_warmup_steps=2500
+            num_warmup_steps=0
         )
 
         scheduler_dict = {
@@ -226,8 +226,6 @@ class MaskedDiffusionLM(L.LightningModule):
             return x
 
         raise TypeError(f"Unsupported batch type: {type(x)}")
-    
-
 
     def training_step(self, batch, batch_idx):
 
