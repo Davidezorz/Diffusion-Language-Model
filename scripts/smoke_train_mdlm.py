@@ -80,7 +80,7 @@ def run_smoke(corruption_type, gamma=0.2):
         print("Running on CPU")
 
     trainer = L.Trainer(
-        max_epochs=3,
+        max_epochs=30,
         limit_train_batches=200,
         accelerator=accelerator,
         devices=1,
