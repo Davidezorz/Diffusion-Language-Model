@@ -2,6 +2,7 @@ import time
 import torch
 import lightning as L
 import datasets
+from transformers import AutoTokenizer
 
 from data_processing.data_manager import DataManager
 from models.mdlm import MaskedDiffusionLM
@@ -16,8 +17,7 @@ def make_toy_dataset(n=512):
         "the cat sat on the mat .",
         "the dog ran in the park .",
         "alice likes red apples .",
-        "bob likes blue cars .",
-        "one two three four five .",
+        "bob likes blue cars ."
     ]
 
     for i in range(n):
@@ -27,6 +27,58 @@ def make_toy_dataset(n=512):
         "train": Dataset.from_dict({"text": texts})
     })
 
+def reconstruction_test(model, dm, device):
+    model.eval()
+
+    texts = [
+        "the cat sat on the mat .",
+        "the dog ran in the park .",
+        "alice likes red apples .",
+        "bob likes blue cars .",
+    ]
+
+    enc = dm.tokenizer(
+        texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=32,
+        add_special_tokens=False,
+    )
+
+    input_ids = enc["input_ids"].to(device)
+    clean = input_ids.clone()
+
+    mask_id = dm.tokenizer.mask_token_id
+
+    # mask 50% of non-pad tokens
+    pad_id = dm.tokenizer.pad_token_id
+    valid = input_ids != pad_id
+    rand = torch.rand(input_ids.shape, device=device)
+    mask = (rand < 0.5) & valid
+
+    corrupted = input_ids.clone()
+    corrupted[mask] = mask_id
+
+    with torch.no_grad():
+        sigma = torch.ones(input_ids.shape[0], device=device) * 0.5
+        logits = model(corrupted, sigma=sigma)
+        pred = logits.argmax(dim=-1)
+
+    reconstructed = corrupted.clone()
+    reconstructed[mask] = pred[mask]
+
+    for i in range(len(texts)):
+        print("\nCLEAN:")
+        print(dm.tokenizer.decode(clean[i], skip_special_tokens=True))
+
+        print("CORRUPTED:")
+        print(dm.tokenizer.decode(corrupted[i], skip_special_tokens=False))
+
+        print("RECONSTRUCTED:")
+        print(dm.tokenizer.decode(reconstructed[i], skip_special_tokens=True))
+
+
 def run_smoke(corruption_type, gamma=0.2):
     caching_directory = ".data/"
 
@@ -35,9 +87,14 @@ def run_smoke(corruption_type, gamma=0.2):
 
     dataset = make_toy_dataset(n=512)
 
+    tokenizer = AutoTokenizer.from_pretrained(
+        "jhu-clsp/ettin-decoder-150m",
+    )
+
     dm = DataManager(
         caching_directory,
-        n_processes=4
+        tokenizer=tokenizer,
+        n_processes=4,
     )
 
     tokens = dm.tokenize(dataset["train"])
@@ -113,21 +170,8 @@ def run_smoke(corruption_type, gamma=0.2):
     print(f"\nTraining time: {time.time() - start:.2f}s")
 
     model.eval()
-
-    with torch.no_grad():
-        samples = model._sample(
-            B=2,
-            num_steps=50
-        )
-
-    for i, sample in enumerate(samples):
-        text = dm.tokenizer.decode(
-            sample,
-            skip_special_tokens=True
-        )
-
-        print(f"\n===== SAMPLE {corruption_type} {i} =====")
-        print(text[:500])
+    device = model.device
+    reconstruction_test(model, dm, device)
 
 
 if __name__ == "__main__":
