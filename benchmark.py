@@ -1,150 +1,165 @@
 import torch
 import torch.nn.functional as F
 
-# ==========================================
-# 1. FUNZIONE PER IL MODELLO AUTOREGRESSIVO
-# ==========================================
-def evaluate_ar_batch(model_ar, input_ids, labels):
+class Perplexity:
     """
-    Calcola la somma della Cross-Entropy loss per un batch nel modello Autoregressivo.
+    This class contains methods to calculate the perplexity for both the Autoregressive model and the Diffusion model.
+    The main method is 'calculate_benchmark_perplexities' that loops through the validation set and computes the final perplexity for both models.
     """
-    # Assicuriamoci di non calcolare gradienti
-    with torch.no_grad():
-        # Forward pass: l'AR vede i token e prevede il successivo
-        logits = model_ar(input_ids)
-        
-        # Shift: i logits in posizione 'i' devono prevedere la label in posizione 'i+1'
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        
-        # Calcoliamo la loss sommata su tutto il batch (ignorando il prompt a -100)
-        # Usiamo reduction='sum' per accumulare il valore totale
-        loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)), 
-            shift_labels.view(-1), 
-            ignore_index=-100, 
-            reduction='sum'
-        )
-        
-        # Contiamo quanti token di VERA risposta c'erano in questo batch
-        valid_tokens = (shift_labels != -100).sum().item()
-        
-    return loss.item(), valid_tokens
+    def __init__(self, model, input_ids, labels, model_type='ar', mask_token_id=103, vocab_size=30522):
+        """
+        Initialize the Perplexity class with the model, input data, and configuration.
+         - model: the language model to evaluate (can be either AR or DDM)
+         - input_ids: the tokenized input sentences (batch of token ids)
+         - labels: the tokenized labels (with -100 for prompt tokens and real token ids for answer tokens)
+         - model_type: 'ar' for Autoregressive, 'ddm' for Diffusion Model
+         - mask_token_id: the token id used for masking in the Diffusion Model (default is 103)
+         - vocab_size: the size of the vocabulary (needed for the DDM loss calculation, default is 30522 for BERT-like models)
+        """
+        self.model = model
+        self.input_ids = input_ids
+        self.labels = labels
+        self.model_type = model_type
+        self.mask_token_id = mask_token_id
+        self.vocab_size = vocab_size
 
+        # Automatically understand if the model is on CPU or GPU
+        self.device = next(model.parameters()).device
 
-# ==========================================
-# 2. FUNZIONE PER IL MODELLO A DIFFUSIONE
-# ==========================================
-def evaluate_ddm_batch(model_ddm, input_ids, labels, mask_token_id, vocab_size):
-    """
-    Calcola la somma della Loss pesata (ELBO) per un batch nel modello a Diffusione.
-    Usa una schedule lineare di base.
-    """
-    batch_size, seq_len = input_ids.shape
-    device = input_ids.device
+    # ==========================================
+    # 1. Function for autoregressive function
+    # ==========================================
+    def _evaluate_ar_batch(self, input_ids, labels):
+        """
+        Compute the sum of the Cross-Entropy loss for a batch in the Autoregressive model.
+        """
+        # Do we not want to calculate the gradient
+        with torch.no_grad():
+            # Forward pass: the AR look the token and predict the following one.
+            logits = self.model(input_ids)
+            
+            # Shift: the logits in position 'i' should predict the label in position 'i+1'
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            
+            # Compute the summed loss on all the batch (we will ignore the prompt setting the value to -100)
+            # Let's we use reduction='sum' to accumulate the total value
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)), 
+                shift_labels.view(-1), 
+                ignore_index=-100, 
+                reduction='sum'
+                )   
+            # Let's count how many token of REAL answer that are in this batch
+            valid_tokens = (shift_labels != -100).sum().item()
+        return loss.item(), valid_tokens
     
-    with torch.no_grad():
-        # 1. Campioniamo un tempo 't' casuale tra 0 e 1 per OGNI frase nel batch
-        t = torch.rand(batch_size, 1, device=device)
+    # ==========================================
+    # 2. Function for Diffusion Model
+    # ==========================================
+    def _evaluate_ddm_batch(self, input_ids, labels):
+        """
+        Compute the sum of the weighted Loss (ELBO) for a batch in the Diffusion Model.
+        Do we use a linear schedule just for start.  
+        """
+        batch_size, seq_len = input_ids.shape
         
-        # Per una schedule lineare, la percentuale di maschera è semplicemente t
-        # (In schedule più complesse, mask_ratio = compute_schedule(t))
-        mask_ratio = t 
+        with torch.no_grad():
+            # Let sample a casual 't' time from 0 to 1 for EVERY sentence in the batch 
+            t = torch.rand(batch_size, 1, device=self.device)
+            # For a linear schedule, the percentage  of masked tocken is simply t
+            # (In a more complex schedules, mask_ratio = compute_schedule(t))
+            mask_ratio = t 
+            # For the linear schedule, the mathematical derived value that works as the ELBO weight is constant (1.0)
+            # If in the future we would use a different schedule, this weight will be changed in function of t
+            weight_t = 1.0 
+            
+            # Let's create a casual mask
+            rand_matrix = torch.rand(batch_size, seq_len, device=self.device)
+            
+            # Let's mask ONLY the token of the answer (labels != -100) 
+            # with a probability of mask_ratio
+            is_response_token = (labels != -100)
+            mask_bool = is_response_token & (rand_matrix < mask_ratio)
+            
+            # We apply the mask to the input
+            masked_input_ids = input_ids.clone()
+            masked_input_ids[mask_bool] = self.mask_token_id
+            
+            # We create the labels for the Loss: let we isolate ONLY the maskered token
+            ddm_labels = labels.clone()
+            ddm_labels[~mask_bool] = -100 
+            
+            # Forward Pass
+            logits = self.model(masked_input_ids)
+            
+            # Compute the Loss NOT reducted, to be able to apply the weight for the sentence
+            loss_per_token = F.cross_entropy(
+                logits.view(-1, self.vocab_size), 
+                ddm_labels.view(-1), 
+                ignore_index=-100, 
+                reduction='none' # Mantain the unroll tensor
+            )
+            
+            # Reroll the tensor to (batch_size, seq_len) and sum the loss for every sentences
+            loss_per_seq = loss_per_token.view(batch_size, seq_len).sum(dim=1)
+            # Multiply for the ELBO weight of the 't' step of that specific sentence
+            weighted_loss_per_seq = loss_per_seq * weight_t
+            # Sum all to obtain the total loss of the batch
+            batch_total_loss = weighted_loss_per_seq.sum().item()
+            # Count how many token has been ACTUALLY masked and valuated in this batch
+            valid_masked_tokens = (ddm_labels != -100).sum().item()
+            
+        return batch_total_loss, valid_masked_tokens
+    # ==========================================
+    # 3. Main validation loop
+    # ==========================================
+    def calculate(self, val_dataloader):
+        """
+        Loop thru the entire dataset and calculate the final Perplexity.
+        """
+        self.model.eval()
         
-        # Per la schedule lineare, la derivata matematica che fa da peso per l'ELBO è costante (1.0)
-        # Se in futuro userete schedule a coseno, questo peso cambierà in funzione di t!
-        weight_t = 1.0 
-        
-        # 2. Creiamo la maschera casuale
-        rand_matrix = torch.rand(batch_size, seq_len, device=device)
-        
-        # Mascheriamo SOLO i token della risposta (labels != -100) 
-        # con una probabilità pari a mask_ratio
-        is_response_token = (labels != -100)
-        mask_bool = is_response_token & (rand_matrix < mask_ratio)
-        
-        # 3. Applichiamo la maschera agli input
-        masked_input_ids = input_ids.clone()
-        masked_input_ids[mask_bool] = mask_token_id
-        
-        # 4. Creiamo le labels per la Loss: isoliamo SOLO i token mascherati
-        ddm_labels = labels.clone()
-        ddm_labels[~mask_bool] = -100 
-        
-        # 5. Forward Pass
-        logits = model_ddm(masked_input_ids)
-        
-        # 6. Calcoliamo la Loss NON ridotta, per poter applicare il peso per singola frase
-        loss_per_token = F.cross_entropy(
-            logits.view(-1, vocab_size), 
-            ddm_labels.view(-1), 
-            ignore_index=-100, 
-            reduction='none' # Manteniamo il tensore srotolato
-        )
-        
-        # Riarrotoliamo il tensore a (batch_size, seq_len) e sommiamo le loss per ogni frase
-        loss_per_seq = loss_per_token.view(batch_size, seq_len).sum(dim=1)
-        
-        # Moltiplichiamo per il peso ELBO dello step 't' di quella specifica frase
-        weighted_loss_per_seq = loss_per_seq * weight_t
-        
-        # Sommiamo tutto per ottenere la loss totale del batch
-        batch_total_loss = weighted_loss_per_seq.sum().item()
-        
-        # Contiamo quanti token sono stati EFFETTIVAMENTE mascherati e valutati in questo batch
-        valid_masked_tokens = (ddm_labels != -100).sum().item()
-        
-    return batch_total_loss, valid_masked_tokens
+        if self.model_type == 'ar':
+            print("🚀 Starting Autoregressive Perplexity Evaluation...")
+            ar_total_loss = 0.0
+            ar_total_tokens = 0
+            # Let's iterate over the validation set
+            for batch in val_dataloader:
+                # Spostiamo i dati sulla GPU (se disponibile)
+                input_ids = batch['input_ids'].to(self.device) 
+                labels = batch['labels'].to(self.device)
+                # AR evaluation
+                ar_loss, ar_tokens = self._evaluate_ar_batch(input_ids, labels)
+                ar_total_loss += ar_loss
+                ar_total_tokens += ar_tokens
+            # --- FINAL COMPUTATION ---
+            # AR: Exponential of the mathematical average
+            ar_mean_loss = ar_total_loss / max(ar_total_tokens, 1) # max per evitare divisioni per zero
+            perplexity = torch.exp(torch.tensor(ar_mean_loss))
 
-
-# ==========================================
-# 3. IL CICLO DI VALIDAZIONE PRINCIPALE
-# ==========================================
-def calculate_benchmark_perplexities(val_dataloader, model_ar, model_ddm, mask_token_id, vocab_size):
-    """
-    Esegue il loop sull'intero dataset e calcola le Perplexity finali.
-    """
-    model_ar.eval()
-    model_ddm.eval()
-    
-    ar_total_loss = 0.0
-    ar_total_tokens = 0
-    
-    ddm_total_loss = 0.0
-    ddm_total_tokens = 0
-    
-    # Iteriamo su tutto il validation set
-    for batch in val_dataloader:
-        # Spostiamo i dati sulla GPU (se disponibile)
-        input_ids = batch['input_ids'].cuda() 
-        labels = batch['labels'].cuda()
+        elif self.model_type == 'ddm':
+            print("🚀 Starting Diffusion Model (ELBO) Perplexity Evaluation...")
+            ddm_total_loss = 0.0
+            ddm_total_tokens = 0
+            # Let's iterate over the validation set
+            for batch in val_dataloader:
+                # Spostiamo i dati sulla GPU (se disponibile)
+                input_ids = batch['input_ids'].to(self.device) 
+                labels = batch['labels'].to(self.device)
+                # DDM evaluation
+                ddm_loss, ddm_tokens = self._evaluate_ddm_batch(input_ids, labels)
+                ddm_total_loss += ddm_loss
+                ddm_total_tokens += ddm_tokens
+            # --- FINAL COMPUTATION ---
+            # DDM: Exponential of the weighted average (ELBO)
+            ddm_mean_loss = ddm_total_loss / max(ddm_total_tokens, 1)
+            perplexity = torch.exp(torch.tensor(ddm_mean_loss))
+            
+        print(f"✅ Evaluation Completed!")
+        print(f"📊 Perplexity: {perplexity.item():.2f}")
         
-        # Valutazione AR
-        ar_loss, ar_tokens = evaluate_ar_batch(model_ar, input_ids, labels)
-        ar_total_loss += ar_loss
-        ar_total_tokens += ar_tokens
-        
-        # Valutazione DDM
-        ddm_loss, ddm_tokens = evaluate_ddm_batch(model_ddm, input_ids, labels, mask_token_id, vocab_size)
-        ddm_total_loss += ddm_loss
-        ddm_total_tokens += ddm_tokens
-        
-    # --- CALCOLO FINALE ---
-    # AR: Esponenziale della media matematica
-    ar_mean_loss = ar_total_loss / max(ar_total_tokens, 1) # max per evitare divisioni per zero
-    ar_perplexity = torch.exp(torch.tensor(ar_mean_loss))
-    
-    # DDM: Esponenziale della media pesata (ELBO)
-    ddm_mean_loss = ddm_total_loss / max(ddm_total_tokens, 1)
-    ddm_perplexity = torch.exp(torch.tensor(ddm_mean_loss))
-    
-    print(f"✅ Valutazione Completata!")
-    print(f"📊 Autoregressive Perplexity: {ar_perplexity.item():.2f}")
-    print(f"📊 Diffusion Model (ELBO) Perplexity: {ddm_perplexity.item():.2f}")
-    
-    return ar_perplexity.item(), ddm_perplexity.item()
-
-
+        return perplexity.item()
 
 def turn_length():
     pass
