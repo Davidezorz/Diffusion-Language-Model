@@ -1,9 +1,12 @@
 import numpy as np
+from scipy import linalg
 import torch
 import torch.nn.functional as F
 from collections import Counter
 import nltk
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from transformers import AutoTokenizer, AutoModel
+from bert_score import score as bert_score_calc
 
 class Perplexity:
     """
@@ -319,7 +322,7 @@ class DiversityEvaluator:
         
         # Subsample to avoid infinite loop
         if len(valid_sequences) > self.sample_size_for_bleu:
-            valid_sequences = random.sample(valid_sequences, self.sample_size_for_bleu)
+            valid_sequences = torch.random.sample(valid_sequences, self.sample_size_for_bleu, replace=False)
             
         total_sentences = len(valid_sequences)
         if total_sentences < 2:
@@ -366,23 +369,135 @@ class DiversityEvaluator:
             self_bleu = self.calculate_self_bleu(sequences)
             print(f"  • Average Self-BLEU:   {self_bleu:.2f} (LOWER is better)")
 
-def turn_length():
-    pass
+class SemanticEvaluator:
+    """
+    Evaluates deep semantic similarity and distribution distances using pre-trained BERT models.
+    Implements BERTScore and Prompt-based Fréchet BERT Distance (FBD).
+    """
+    def __init__(self, bert_model_name="bert-base-uncased", device="cuda"):
+        """
+        Initializes the evaluation models ONCE to save I/O overhead.
+        """
+        self.device = device if torch.cuda.is_available() else "cpu"
+        self.bert_model_name = bert_model_name
+        
+        print(f"Loading BERT evaluator ({bert_model_name}) into {self.device}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(bert_model_name)
+        self.model = AutoModel.from_pretrained(bert_model_name).to(self.device)
+        self.model.eval()
 
-def marker_correctness():
-    pass
+    def calculate_bertscore(self, references, hypotheses):
+        """
+        Calculates the BERTScore between generated responses (hypotheses) 
+        and ground-truth responses (references).
+        Returns the F1 scores mean.
+        """
+        print("Calculating BERTScore...")
+        # We use the official bert_score library for robust calculation
+        P, R, F1 = bert_score_calc(
+            cands=hypotheses, 
+            refs=references, 
+            lang="en", # Change to "it" if your chat dataset is in Italian
+            model_type=self.bert_model_name,
+            device=self.device,
+            verbose=False
+        )
+        return F1.mean().item() * 100 # Return as percentage
 
-def self_bleu():
-    pass
+    def _get_sentence_embeddings(self, texts, batch_size=32):
+        """
+        Helper method to extract the [CLS] embedding from BERT for a list of texts.
+        Uses batching to prevent Out Of Memory errors on large datasets.
+        """
+        all_embeddings = []
+        
+        with torch.no_grad():
+            for i in range(0, len(texts), batch_size):
+                batch_texts = texts[i:i+batch_size]
+                
+                inputs = self.tokenizer(
+                    batch_texts, 
+                    padding=True, 
+                    truncation=True, 
+                    max_length=512, 
+                    return_tensors="pt"
+                ).to(self.device)
+                
+                outputs = self.model(**inputs)
+                
+                # Extract the [CLS] token representation (the first token) 
+                # which acts as the aggregated sentence embedding
+                cls_embeddings = outputs.last_hidden_state[:, 0, :]
+                all_embeddings.append(cls_embeddings.cpu().numpy())
+                
+        return np.concatenate(all_embeddings, axis=0)
 
-def conversational_diversity():
-    pass
+    def calculate_frechet_bert_distance(self, prompts, real_responses, generated_responses):
+        """
+        Calculates FBD on the joint distribution of [Prompt + Response].
+        Measures if the generated conversational flow matches the real human flow.
+        LOWER distance is better.
+        """
+        print("Extracting embeddings for Fréchet Distance...")
+        
+        # 1. Create the joint conversational strings
+        real_conversations = [f"{p} [SEP] {r}" for p, r in zip(prompts, real_responses)]
+        generated_conversations = [f"{p} [SEP] {g}" for p, g in zip(prompts, generated_responses)]
+        
+        # 2. Extract embeddings
+        real_embs = self._get_sentence_embeddings(real_conversations)
+        gen_embs = self._get_sentence_embeddings(generated_conversations)
+        
+        # 3. Calculate Mean and Covariance matrices for both distributions
+        mu_real = np.mean(real_embs, axis=0)
+        sigma_real = np.cov(real_embs, rowvar=False)
+        
+        mu_gen = np.mean(gen_embs, axis=0)
+        sigma_gen = np.cov(gen_embs, rowvar=False)
+        
+        print("Computing Fréchet Math...")
+        
+        # 4. The Fréchet Math: d^2 = ||mu1 - mu2||^2 + Tr(C1 + C2 - 2*sqrt(C1*C2))
+        diff = mu_real - mu_gen
+        
+        # Matrix square root of the product of covariances
+        covmean, _ = linalg.sqrtm(sigma_real.dot(sigma_gen), disp=False)
+        
+        # Prevent complex numbers caused by floating point inaccuracies
+        if np.iscomplexobj(covmean):
+            covmean = covmean.real
+            
+        frechet_distance = diff.dot(diff) + np.trace(sigma_real + sigma_gen - 2.0 * covmean)
+        
+        return frechet_distance
 
-def bert_score():
-    pass
-
-def frechet_bert_distance():
-    pass
+    def evaluate_models(self, dataset_dict):
+        """
+        Main runner. Expects a dictionary with lists of raw strings:
+        {
+          'prompts': ["Hi!", "How are you?"],
+          'real': ["Hello!", "I'm fine."],
+          'ar': ["Hey there.", "I am good."],
+          'ddm': ["Hi.", "Doing okay."]
+        }
+        """
+        print("\n" + "="*50)
+        print("🧠 SEMANTIC & DISTRIBUTION REPORT (BERT-BASED)")
+        print("="*50)
+        
+        prompts = dataset_dict['prompts']
+        real_resp = dataset_dict['real']
+        
+        for model in ['ar', 'ddm']:
+            gen_resp = dataset_dict[model]
+            
+            print(f"\n[{model.upper()} MODEL]")
+            
+            b_score = self.calculate_bertscore(references=real_resp, hypotheses=gen_resp)
+            print(f"  • BERTScore (F1):           {b_score:.2f}% (Higher is better)")
+            
+            fbd_score = self.calculate_frechet_bert_distance(prompts, real_resp, gen_resp)
+            print(f"  • Fréchet BERT Dist (FBD):  {fbd_score:.2f} (LOWER is better)")
 
 def llm_as_judge():
     pass
