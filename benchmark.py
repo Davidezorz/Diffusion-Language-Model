@@ -1,6 +1,9 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
+from collections import Counter
+import nltk
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
 class Perplexity:
     """
@@ -268,6 +271,100 @@ class ChatStructureEvaluator:
                 err_usr = (data['user_hallucinations'] / total_seqs) * 100
                 print(f"  • Missing EOS:      {err_eos:.1f}% ({data['missing_eos']} occurrences)")
                 print(f"  • User Hallucination:{err_usr:.1f}% ({data['user_hallucinations']} occurrences)")
+
+class DiversityEvaluator:
+    """
+    Evaluates the lexical and structural diversity of generated texts.
+    Combines Unique Token Ratio (Vocabulary richness) and Self-BLEU (Structural repetitiveness).
+    """
+    def __init__(self, sample_size_for_bleu=1000, n_gram_size=2):
+        """
+        - sample_size_for_bleu: Max number of sentences to evaluate for Self-BLEU (prevents O(N^2) explosion).
+        - n_gram_size: The N-gram size for the Unique Token Ratio (1 = unique words, 2 = unique bigrams).
+        """
+        self.sample_size_for_bleu = sample_size_for_bleu
+        self.n_gram_size = n_gram_size
+        
+        # Smoothing function is critical for short chat responses!
+        # Without it, responses shorter than 4 words will crash the BLEU calculation.
+        self.smoother = SmoothingFunction().method1
+
+    def _get_ngrams(self, sequence, n):
+        """Helper to extract n-grams from a list of tokens."""
+        return [tuple(sequence[i:i+n]) for i in range(len(sequence)-n+1)]
+
+    def calculate_unique_ratio(self, list_of_token_sequences):
+        """
+        Calculates the Type-Token Ratio (TTR) based on N-grams.
+        Higher is better (more diverse vocabulary).
+        """
+        all_ngrams = []
+        for seq in list_of_token_sequences:
+            all_ngrams.extend(self._get_ngrams(seq, self.n_gram_size))
+            
+        if not all_ngrams:
+            return 0.0
+            
+        unique_ngrams = set(all_ngrams)
+        ratio = len(unique_ngrams) / len(all_ngrams)
+        return ratio * 100 # Return as percentage
+
+    def calculate_self_bleu(self, list_of_token_sequences):
+        """
+        Calculates Self-BLEU by comparing each sentence against the rest of the generated corpus.
+        LOWER is better (less repetitiveness).
+        """
+        # Filter out extremely short sequences (e.g., less than 2 tokens) to avoid noisy scores
+        valid_sequences = [seq for seq in list_of_token_sequences if len(seq) > 1]
+        
+        # Subsample to avoid infinite loop
+        if len(valid_sequences) > self.sample_size_for_bleu:
+            valid_sequences = random.sample(valid_sequences, self.sample_size_for_bleu)
+            
+        total_sentences = len(valid_sequences)
+        if total_sentences < 2:
+            return 0.0
+
+        bleu_scores = []
+        
+        # O(N^2) operation on the sampled subset
+        for i in range(total_sentences):
+            hypothesis = valid_sequences[i]
+            
+            # The references are ALL OTHER generated sentences
+            # We slice the list to exclude the current hypothesis
+            references = valid_sequences[:i] + valid_sequences[i+1:]
+            
+            # Calculate BLEU score (using tokens directly, no string decoding needed!)
+            score = sentence_bleu(references, hypothesis, smoothing_function=self.smoother)
+            bleu_scores.append(score)
+            
+        # Return average Self-BLEU (0 to 100)
+        return np.mean(bleu_scores) * 100
+
+    def evaluate_models(self, results_dict):
+        """
+        Main runner. Expects a dictionary like: 
+        {'AR': [[12, 45, ...], [..]], 'DDM': [...], 'REAL': [...]}
+        Note: Sequences must be JUST THE RESPONSES, prompt must be removed!
+        """
+        print("\n" + "="*50)
+        print("🌍 LEXICAL & CONVERSATIONAL DIVERSITY REPORT")
+        print("="*50)
+        
+        for model_name, sequences in results_dict.items():
+            if not sequences:
+                continue
+                
+            print(f"\n[{model_name} MODEL]")
+            
+            # 1. Unique Token Ratio
+            unique_ratio = self.calculate_unique_ratio(sequences)
+            print(f"  • Unique {self.n_gram_size}-gram Ratio: {unique_ratio:.2f}% (Higher is better)")
+            
+            # 2. Self-BLEU
+            self_bleu = self.calculate_self_bleu(sequences)
+            print(f"  • Average Self-BLEU:   {self_bleu:.2f} (LOWER is better)")
 
 def turn_length():
     pass
