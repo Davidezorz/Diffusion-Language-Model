@@ -11,3 +11,6 @@ matplotlib    == 3.10.7
 scikit-learn  == 1.7.2
 
 omegaconf     == 2.3.0
+
+#benchmark libraries
+nltk          == 3.8.1
