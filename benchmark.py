@@ -1,12 +1,18 @@
 import numpy as np
-from scipy import linalg
 import torch
-import torch.nn.functional as F
-from collections import Counter
+import os
+import json
+import random
 import nltk
+import matplotlib.pyplot as plt
+import torch.nn.functional as F
+from scipy import linalg
+from collections import Counter
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from transformers import AutoTokenizer, AutoModel
 from bert_score import score as bert_score_calc
+from openai import OpenAI
+from tqdm import tqdm
 
 class Perplexity:
     """
@@ -499,21 +505,468 @@ class SemanticEvaluator:
             fbd_score = self.calculate_frechet_bert_distance(prompts, real_resp, gen_resp)
             print(f"  • Fréchet BERT Dist (FBD):  {fbd_score:.2f} (LOWER is better)")
 
-def llm_as_judge():
-    pass
+class LLMJudgeEvaluator:
+    """
+    Evaluates conversational models using an LLM-as-a-Judge in a Pairwise A/B test setup.
+    Requires an OpenAI-compatible API (can be OpenAI, Groq, Ollama, vLLM).
+    """
+    def __init__(self, api_key=None, base_url=None, model_name="gpt-4o-mini"):
+        """
+        Initializes the LLM Client.
+        If you want to use local Llama-3 via Ollama:
+        - download and run Ollama server: https://ollama.com/docs/installation
+        - download Llama-3 model (8B parameters): `ollama pull llama3`
+        - launch the server: `ollama serve`
+        - call the class as: LLMJudgeEvaluator(base_url="http://localhost:11434/v1", model_name="llama3")
+        """
+        self.client = OpenAI(
+            api_key=api_key or os.environ.get("OPENAI_API_KEY", "dummy-key"),
+            base_url=base_url
+        )
+        self.model_name = model_name
+        
+        # Results tracker
+        self.results = {
+            'AR_wins': 0,
+            'DDM_wins': 0,
+            'Ties': 0,
+            'Errors': 0
+        }
+
+    def _get_system_prompt(self):
+        """
+        The Rubric. This is the most critical part of the LLM-as-a-Judge.
+        It defines the criteria and forces JSON output.
+        """
+        return """You are an impartial, expert evaluator of AI conversational models.
+Your task is to compare two responses (Model A and Model B) to a given User Prompt.
+
+Evaluate based on the following criteria:
+1. Relevance: Does it answer the prompt directly and accurately?
+2. Fluency: Is the language natural and grammatically correct?
+3. Coherence: Does the text flow logically without structural hallucinations?
+4. Conciseness: Penalize responses that are unnecessarily verbose or repetitive.
+
+You must output ONLY a valid JSON object with the following structure:
+{
+    "reasoning": "A brief step-by-step explanation comparing both models.",
+    "winner": "A" | "B" | "Tie"
+}
+Do not include markdown blocks or any other text outside the JSON.
+"""
+
+    def _evaluate_pair(self, prompt, ar_response, ddm_response):
+        """
+        Evaluates a single pair of responses. 
+        Includes 'Position Bias' mitigation by randomly swapping A and B.
+        """
+        # Randomize positions to avoid "Position Bias" (LLMs often favor Model A)
+        swap = random.choice([True, False])
+        
+        if swap:
+            model_a, model_b = ddm_response, ar_response
+            ar_label, ddm_label = "B", "A"
+        else:
+            model_a, model_b = ar_response, ddm_response
+            ar_label, ddm_label = "A", "B"
+
+        # Construct the user message
+        user_message = f"""[USER PROMPT]
+{prompt}
+
+[MODEL A RESPONSE]
+{model_a}
+
+[MODEL B RESPONSE]
+{model_b}
+"""
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": self._get_system_prompt()},
+                    {"role": "user", "content": user_message}
+                ],
+                # Force JSON mode for easy parsing
+                response_format={ "type": "json_object" }, 
+                temperature=0.0 # Temperature 0 for deterministic evaluation
+            )
+            
+            # Parse the JSON output
+            result_json = json.loads(response.choices[0].message.content)
+            winner = result_json.get("winner")
+            reasoning = result_json.get("reasoning")
+            
+            # De-swap to figure out who actually won
+            if winner == "Tie":
+                actual_winner = "Tie"
+            elif winner == ar_label:
+                actual_winner = "AR"
+            elif winner == ddm_label:
+                actual_winner = "DDM"
+            else:
+                actual_winner = "Error"
+                
+            return actual_winner, reasoning
+            
+        except Exception as e:
+            print(f"API Error: {e}")
+            return "Error", str(e)
+
+    def run_benchmark(self, dataset_dict):
+        """
+        Runs the pairwise evaluation over the whole dataset.
+        Expects: {'prompts': [...], 'ar': [...], 'ddm': [...]}
+        """
+        print(f"🚀 Starting LLM-as-a-Judge Evaluation using {self.model_name}...")
+        
+        prompts = dataset_dict['prompts']
+        ar_resps = dataset_dict['ar']
+        ddm_resps = dataset_dict['ddm']
+        
+        # Save detailed reasoning for the final report
+        detailed_logs = []
+        
+        for p, ar, ddm in tqdm(zip(prompts, ar_resps, ddm_resps), total=len(prompts)):
+            winner, reasoning = self._evaluate_pair(p, ar, ddm)
+            
+            if winner == "AR":
+                self.results['AR_wins'] += 1
+            elif winner == "DDM":
+                self.results['DDM_wins'] += 1
+            elif winner == "Tie":
+                self.results['Ties'] += 1
+            else:
+                self.results['Errors'] += 1
+                
+            detailed_logs.append({
+                "prompt": p,
+                "winner": winner,
+                "reasoning": reasoning
+            })
+            
+        return self.results, detailed_logs
+
+    def print_report(self):
+        """Prints the win-rate statistics."""
+        total = sum(self.results.values()) - self.results['Errors']
+        if total == 0:
+            print("No successful evaluations.")
+            return
+            
+        ar_winrate = (self.results['AR_wins'] / total) * 100
+        ddm_winrate = (self.results['DDM_wins'] / total) * 100
+        tie_rate = (self.results['Ties'] / total) * 100
+        
+        print("\n" + "="*50)
+        print("⚖️ LLM-AS-A-JUDGE WIN-RATE REPORT")
+        print("="*50)
+        print(f"  🏆 Autoregressive (AR) Win Rate: {ar_winrate:.1f}%")
+        print(f"  🏆 Diffusion (DDM) Win Rate:     {ddm_winrate:.1f}%")
+        print(f"  🤝 Tie Rate:                     {tie_rate:.1f}%")
+        print(f"  (Errors/Failures: {self.results['Errors']})")
 
 # Benchmarking methods that track the performance through steps of unmasking process for the Discrete Diffusion Model, for different unmasking policies.
-def perplexity_through_steps():
-    pass
+class DiffusionTrajectoryEvaluator:
+    """
+    Evaluates the generation trajectory of a Discrete Diffusion Model step-by-step.
+    Tracks Entropy, Step-Perplexity, and Internal Semantic Convergence (Self-Similarity).
+    """
+    def __init__(self, mask_token_id):
+        self.mask_token_id = mask_token_id
+        
+        # Global history across the entire dataset
+        self.history = {
+            'entropy': {},
+            'step_ppl': {},
+            'semantic_convergence': {} # Cosine similarity to the final step
+        }
+        
+        # Temporary storage for the current batch being generated
+        self._temp_batch_data = {}
 
-def entropy_through_steps():
-    pass
+    def start_new_batch(self):
+        """
+        Must be called right before starting the step-by-step loop for a new batch.
+        """
+        self._temp_batch_data = {
+            'entropy': {},
+            'step_ppl': {},
+            'hidden_states': {}
+        }
 
-def inter_step_bert_score():
-    pass
+    def _calculate_entropy(self, logits, masked_indices):
+        """Calculates Shannon Entropy only for currently masked tokens."""
+        masked_logits = logits[masked_indices]
+        if masked_logits.numel() == 0:
+            return 0.0
+            
+        probs = F.softmax(masked_logits, dim=-1)
+        entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1)
+        return entropy.mean().item()
 
-def part_of_speech_emergence():
-    pass
+    def _calculate_step_ppl(self, logits, masked_indices, target_labels):
+        """Calculates pseudo-perplexity only for currently masked tokens."""
+        masked_logits = logits[masked_indices]
+        masked_targets = target_labels[masked_indices]
+        
+        if masked_logits.numel() == 0 or masked_targets.numel() == 0:
+            return 1.0
+            
+        loss = F.cross_entropy(masked_logits, masked_targets, reduction='mean')
+        return torch.exp(loss).item()
 
-def prompt_adherence_through_steps():
-    pass
+    def update_step(self, step, logits, last_hidden_state, current_input_ids, target_labels):
+        """
+        Runs inside the DDM inference loop at each step.
+        """
+        masked_indices = (current_input_ids == self.mask_token_id)
+        
+        # 1. Track Fast Math Metrics
+        ent = self._calculate_entropy(logits, masked_indices)
+        self._temp_batch_data['entropy'][step] = ent
+        
+        ppl = self._calculate_step_ppl(logits, masked_indices, target_labels)
+        self._temp_batch_data['step_ppl'][step] = ppl
+        
+        # 2. Track Semantic State (Hidden State)
+        # Average pooling across the sequence length to get a single vector per sentence.
+        # Shape goes from (batch_size, seq_len, hidden_dim) -> (batch_size, hidden_dim)
+        # .detach().cpu() is CRUCIAL to prevent GPU Out Of Memory!
+        pooled_state = last_hidden_state.mean(dim=1).detach().cpu()
+        self._temp_batch_data['hidden_states'][step] = pooled_state
+
+    def finalize_batch(self):
+        """
+        Must be called AFTER the step-by-step loop finishes for the current batch.
+        It computes the semantic similarity backwards.
+        """
+        steps = sorted(self._temp_batch_data['hidden_states'].keys())
+        if not steps:
+            return
+            
+        # The last step represents the "Final Grounded Meaning" of the generation
+        final_step = steps[-1]
+        final_states = self._temp_batch_data['hidden_states'][final_step]
+        
+        for step in steps:
+            # Initialize global dictionary lists if they don't exist
+            if step not in self.history['entropy']:
+                self.history['entropy'][step] = []
+                self.history['step_ppl'][step] = []
+                self.history['semantic_convergence'][step] = []
+                
+            # Append fast metrics
+            self.history['entropy'][step].append(self._temp_batch_data['entropy'][step])
+            self.history['step_ppl'][step].append(self._temp_batch_data['step_ppl'][step])
+            
+            # Calculate Semantic Convergence (Cosine Similarity)
+            current_states = self._temp_batch_data['hidden_states'][step]
+            
+            # cosine_similarity returns a tensor of shape (batch_size,)
+            # We take the mean to get a single number for this batch at this step
+            cos_sim = F.cosine_similarity(current_states, final_states, dim=-1)
+            self.history['semantic_convergence'][step].append(cos_sim.mean().item())
+
+    def get_aggregated_trajectory(self):
+        """Returns the final averaged trajectory arrays ready for plotting."""
+        trajectory = {}
+        for metric, steps_dict in self.history.items():
+            if not steps_dict:
+                continue
+            sorted_steps = sorted(steps_dict.keys())
+            trajectory[metric] = {
+                'steps': sorted_steps,
+                'values': [np.mean(steps_dict[s]) for s in sorted_steps]
+            }
+        return trajectory
+
+#==========================================
+# MAIN BENCHMARK ORCHESTRATOR
+#==========================================
+class BenchmarkOrchestrator:
+    """
+    Main Launcher to handle Generation, Evaluation, and Plotting for the AR vs DDM benchmark.
+
+    /vostro_progetto
+    ├── run_benchmarks.py      <-- the Launcher
+    ├── /results
+    │   ├── /datasets          <-- Here we save the generated samples (prompts, ar, ddm)
+    │   ├── /metrics           <-- Here we save the raw JSON scores
+    │   └── /plots             <-- Here the PDF/PNG plots end up
+    """
+    def __init__(self, model_ar=None, model_ddm=None, dataloader=None, results_dir="./results"):
+        self.model_ar = model_ar
+        self.model_ddm = model_ddm
+        self.dataloader = dataloader
+        self.results_dir = results_dir
+        
+        # Create directory structure
+        self.dirs = {
+            'datasets': os.path.join(results_dir, "datasets"),
+            'metrics': os.path.join(results_dir, "metrics"),
+            'plots': os.path.join(results_dir, "plots")
+        }
+        for d in self.dirs.values():
+            os.makedirs(d, exist_ok=True)
+
+    # ==========================================
+    # 1. GENERATION PHASE
+    # ==========================================
+    def generate_and_save_dataset(self, filename="eval_dataset.json", max_samples=None):
+        """
+        Generates text using both models and saves the prompt, real response, AR, and DDM responses.
+        If the file already exists, it can skip generation to save time.
+        """
+        filepath = os.path.join(self.dirs['datasets'], filename)
+        
+        if os.path.exists(filepath):
+            print(f"📦 Dataset found at {filepath}. Skipping generation.")
+            return filepath
+            
+        print("🚀 Starting Generation Phase...")
+        self.model_ar.eval()
+        self.model_ddm.eval()
+        
+        dataset = {
+            'prompts': [],
+            'real_responses': [],
+            'ar_responses': [],
+            'ddm_responses': []
+        }
+        
+        samples_processed = 0
+        
+        with torch.no_grad():
+            for batch in tqdm(self.dataloader, desc="Generating Texts"):
+                if max_samples and samples_processed >= max_samples:
+                    break
+                    
+                prompts = batch['input_ids'].cuda()
+                
+                # 1. Get AR Generation (Replace with your specific AR generation function)
+                ar_gen = self.model_ar.generate(prompts, max_length=100)
+                
+                # 2. Get DDM Generation (Replace with your specific DDM unmasking loop)
+                ddm_gen = self.model_ddm.generate_with_unmasking_policy(prompts, steps=20)
+                
+                # Note: Decode the tensors to strings here before saving to JSON!
+                # dataset['prompts'].extend(decoded_prompts)
+                # dataset['real_responses'].extend(decoded_reals)
+                # dataset['ar_responses'].extend(decoded_ar)
+                # dataset['ddm_responses'].extend(decoded_ddm)
+                
+                samples_processed += prompts.size(0)
+                
+        # Save to disk
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(dataset, f, indent=4)
+        print(f"✅ Generation complete. Saved {samples_processed} samples to {filepath}")
+        return filepath
+
+    # ==========================================
+    # 2. EVALUATION PHASE
+    # ==========================================
+    def load_dataset(self, filename="eval_dataset.json"):
+        filepath = os.path.join(self.dirs['datasets'], filename)
+        with open(filepath, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    def run_all_benchmarks(self, dataset_filename="eval_dataset.json"):
+        """
+        Loads the generated text and runs the requested evaluators.
+        """
+        print("🧪 Starting Evaluation Phase...")
+        data = self.load_dataset(dataset_filename)
+        
+        results = {}
+        
+        # --- 2.1 Diversity Benchmark (Unique Tokens & Self-BLEU) ---
+        print("\n--> Running Diversity Evaluator...")
+        # evaluator_div = DiversityEvaluator()
+        # results['diversity'] = evaluator_div.evaluate_models(data)
+        
+        # --- 2.2 Semantic Benchmark (BERTScore & Fréchet) ---
+        print("\n--> Running Semantic Evaluator...")
+        # evaluator_sem = SemanticEvaluator()
+        # results['semantic'] = evaluator_sem.evaluate_models(data)
+        
+        # --- 2.3 LLM Judge Benchmark ---
+        print("\n--> Running LLM Judge Evaluator...")
+        # evaluator_judge = LLMJudgeEvaluator(model_name="llama3") # Local Ollama
+        # results['judge'] = evaluator_judge.run_benchmark(data)
+        
+        # Save aggregated metrics
+        metrics_file = os.path.join(self.dirs['metrics'], "final_metrics.json")
+        with open(metrics_file, 'w') as f:
+            json.dump(results, f, indent=4)
+        print(f"✅ All evaluations complete. Metrics saved to {metrics_file}")
+        
+        return results
+
+    # ==========================================
+    # 3. PLOTTING PHASE (Matplotlib)
+    # ==========================================
+    def generate_plots(self, metrics_filename="final_metrics.json", trajectory_data=None):
+        """
+        Reads the saved metrics and generates professional Matplotlib charts.
+        """
+        print("📊 Generating Plots...")
+        metrics_path = os.path.join(self.dirs['metrics'], metrics_filename)
+        
+        # 1. Comparative Bar Charts (AR vs DDM)
+        if os.path.exists(metrics_path):
+            with open(metrics_path, 'r') as f:
+                metrics = json.load(f)
+                
+            fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+            models = ['AR', 'DDM']
+            
+            # Example Bar: LLM Judge Win Rate
+            if 'judge' in metrics:
+                wins = [metrics['judge']['AR_wins'], metrics['judge']['DDM_wins']]
+                axs[0].bar(models, wins, color=['#4C72B0', '#DD8452'])
+                axs[0].set_title('LLM Judge Wins')
+                axs[0].set_ylabel('Number of Wins')
+                
+            # Example Bar: Diversity (Self-BLEU)
+            if 'diversity' in metrics:
+                bleu = [metrics['diversity']['ar']['self_bleu'], metrics['diversity']['ddm']['self_bleu']]
+                axs[1].bar(models, bleu, color=['#4C72B0', '#DD8452'])
+                axs[1].set_title('Self-BLEU (Lower is better)')
+                
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.dirs['plots'], 'comparative_bars.pdf'))
+            plt.close()
+
+        # 2. Line Charts for DDM Trajectory (Step-by-Step)
+        # This requires the data from the DiffusionTrajectoryEvaluator
+        if trajectory_data:
+            fig, ax1 = plt.subplots(figsize=(10, 6))
+            
+            steps = trajectory_data['entropy']['steps']
+            entropy_vals = trajectory_data['entropy']['values']
+            sim_vals = trajectory_data['semantic_convergence']['values']
+            
+            # Plot Entropy on left Y-axis
+            color = 'tab:red'
+            ax1.set_xlabel('Generative Steps (t)')
+            ax1.set_ylabel('Masked Entropy', color=color)
+            ax1.plot(steps, entropy_vals, color=color, marker='o', linewidth=2, label='Entropy')
+            ax1.tick_params(axis='y', labelcolor=color)
+            ax1.grid(True, linestyle='--', alpha=0.6)
+            
+            # Plot Semantic Convergence on right Y-axis
+            ax2 = ax1.twinx()
+            color = 'tab:blue'
+            ax2.set_ylabel('Cosine Similarity (to final state)', color=color)
+            ax2.plot(steps, sim_vals, color=color, marker='s', linewidth=2, label='Semantic Convergence')
+            ax2.tick_params(axis='y', labelcolor=color)
+            
+            plt.title('DDM Generation Trajectory (Unmasking Policy Analysis)')
+            fig.tight_layout()
+            plt.savefig(os.path.join(self.dirs['plots'], 'ddm_trajectory.pdf'))
+            plt.close()
+            
+        print(f"✅ Plots generated and saved to {self.dirs['plots']}")
