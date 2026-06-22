@@ -31,7 +31,6 @@ This module implements the training and sampling logic for a masked discrete
 diffusion language model; in this file we:
     1. Define the forward corruption process q(x_t | x_0)
        - independent token masking, as in vanilla MDLM
-       - optional span masking, used as our modification
        - optional position-dependent masking
 
     2. Sample diffusion times t and convert them into noise levels sigma(t)
@@ -138,9 +137,8 @@ class MaskedDiffusionLM(L.LightningModule):
         self.fast_forward_epochs = None
         self.fast_forward_batches = None
 
-        # toggle for the type of corruption (later, span and position)
-        self.corruption_type = "independent"  # "independent", "span", "position"
-        self.max_span = 5
+        # toggle for the type of corruption (later, position)
+        self.corruption_type = "independent"  # "independent", "position"
 
         # position-dependent noising
         self.position_gamma = 2.0
@@ -244,14 +242,14 @@ class MaskedDiffusionLM(L.LightningModule):
 
         self._running_losses.append(loss.item())
 
-        if batch_idx % 10 == 0:
-            avg10 = sum(self._running_losses[-10:]) / min(10, len(self._running_losses))
-            print(
-                f"[{self.corruption_type}] "
-                f"batch={batch_idx:03d} "
-                f"loss={loss.item():.4f} "
-                f"avg10={avg10:.4f}"
-            )
+        # if batch_idx == 0:
+        #     avg10 = sum(self._running_losses[-10:]) / min(10, len(self._running_losses))
+        #     print(
+        #         f"[{self.corruption_type}] "
+        #         f"batch={batch_idx:03d} "
+        #         f"loss={loss.item():.4f} "
+        #         f"avg10={avg10:.4f}"
+        #     )
 
         self.train_metrics.update(losses.nlls, losses.token_mask)
 
@@ -344,9 +342,6 @@ class MaskedDiffusionLM(L.LightningModule):
         if self.corruption_type == "independent":
             return self.q_xt_independent(x, p)
 
-        elif self.corruption_type == "span":
-            return self.q_xt_span(x, p, max_span=self.max_span)
-
         # since q_xt_independent is equipped of using p as:
         # - different for every position
         # - independent bernoulli using p
@@ -363,46 +358,7 @@ class MaskedDiffusionLM(L.LightningModule):
     def q_xt_independent(self, x, p):
         move_indices = torch.rand(*x.shape, device=x.device) < p
         return torch.where(move_indices, self.mask_index, x)
-
-    # span corruption
-    def q_xt_span(self, x, p, max_span=5):
-
-        B, T = x.shape
-        device = x.device
-
-        mask = torch.zeros((B, T), dtype=torch.bool, device=device)
-        max_span = max_span if max_span > 0 else 4 # we set default span to 4
-
-        for b in range(B):
-
-            # desired number of masked tokens K_t, which we know is approx (1-a_t)L
-            target = int((p[b, 0] * T).item())
-
-            masked = 0
-
-            while masked < target:
-
-                span_len = torch.randint(1, max_span + 1, (1,), device=device).item()
-
-                start = torch.randint(0, T, (1,), device=device).item()
-                end = min(start + span_len, T)
-
-                before = mask[b].sum().item()
-                mask[b, start:end] = True
-                after = mask[b].sum().item()
-
-                masked += after - before
-
-                if mask[b].all():
-                    break
-
-        xt = torch.where(
-            mask,
-            self.mask_index,
-            x
-        )
-
-        return xt
+    
 
     def position_dependent_noise(self, t, T, device):
         """

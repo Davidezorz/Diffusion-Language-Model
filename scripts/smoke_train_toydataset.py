@@ -85,13 +85,84 @@ def reconstruction_test(model, dm, device):
     print("pred:  ", dm.tokenizer.decode(pred[token_mask]))
 
 
+def reconstruction_test_random(model, dm, device, texts, mask_prob=0.3, max_length=128):
+    model.eval()
+
+    enc = dm.tokenizer(
+        texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+        add_special_tokens=False,
+    )
+
+    x0 = enc["input_ids"].to(device)
+    attention_mask = enc["attention_mask"].to(device).bool()
+
+    pad_id = dm.tokenizer.pad_token_id
+    valid = attention_mask & (x0 != pad_id)
+
+    token_mask = (torch.rand(x0.shape, device=device) < mask_prob) & valid
+
+    xt = x0.clone()
+    xt[token_mask] = model.mask_index
+
+    with torch.no_grad():
+        sigma = torch.ones(x0.shape[0], device=device) * 0.5
+        log_probs = model(xt, sigma=sigma)
+        pred = log_probs.argmax(dim=-1)
+
+    reconstructed = xt.clone()
+    reconstructed[token_mask] = pred[token_mask]
+
+    acc = (pred[token_mask] == x0[token_mask]).float().mean().item()
+
+    print(f"\nMasked reconstruction accuracy: {acc:.4f}")
+
+    T = x0.shape[1]
+    positions = torch.arange(T, device=device)
+    norm_pos = positions.float() / (T - 1)
+
+    bins = [
+        (0.00, 0.25),
+        (0.25, 0.50),
+        (0.50, 0.75),
+        (0.75, 1.00),
+    ]
+
+    for low, high in bins:
+
+        pos_mask = (
+            (norm_pos >= low)
+            & (norm_pos < high)
+        )[None, :]
+
+        mask = token_mask & pos_mask
+
+        if mask.sum() > 10:
+            acc = (
+                pred[mask] == x0[mask]
+            ).float().mean().item()
+
+            print(
+                f"{low:.2f}-{high:.2f}: {acc:.4f}"
+            )
+
+
 def run_smoke(corruption_type, gamma=0.2):
     caching_directory = ".data/"
 
     B = 8
     T = 32
 
-    dataset = make_toy_dataset(n=512)
+    dataset = datasets.load_dataset(
+    "wikitext",
+    "wikitext-2-raw-v1",
+    cache_dir=caching_directory
+)
+    dataset = dataset["train"].filter(lambda x: len(x["text"].strip()) > 50)
+    dataset = dataset.select(range(100))
 
     tokenizer = AutoTokenizer.from_pretrained(
         "jhu-clsp/ettin-decoder-150m",
@@ -103,7 +174,7 @@ def run_smoke(corruption_type, gamma=0.2):
         n_processes=4,
     )
 
-    tokens = dm.tokenize(dataset["train"])
+    tokens = dm.tokenize(dataset)
     data = dm.group_texts(tokens, T)
 
     def collate_fn(batch):
@@ -140,7 +211,11 @@ def run_smoke(corruption_type, gamma=0.2):
 
     model.corruption_type = corruption_type
     model.position_gamma = gamma
-    model.position_loss_weighting = False
+
+    if corruption_type == "position":
+        model.position_loss_weighting = True
+    else:
+        model.position_loss_weighting = False
 
     print("\n==============================")
     print(f"Running: {corruption_type}")
@@ -157,8 +232,8 @@ def run_smoke(corruption_type, gamma=0.2):
         print("Running on CPU")
 
     trainer = L.Trainer(
-        max_epochs=10,
-        limit_train_batches=100,
+        max_epochs=1000,
+        limit_train_batches=50,
         accelerator=accelerator,
         devices=1,
         precision=precision,
@@ -168,18 +243,25 @@ def run_smoke(corruption_type, gamma=0.2):
 
     start = time.time()
 
-    trainer.fit(
-        model,
-        train_dataloaders=loader
-    )
+    # trainer.fit(
+    #     model,
+    #     train_dataloaders=loader
+    # )
 
     print(f"\nTraining time: {time.time() - start:.2f}s")
 
     model.eval()
     device = model.device
-    reconstruction_test(model, dm, device)
+
+    test_texts = [
+    dataset[0]["text"],
+    dataset[1]["text"],
+    dataset[2]["text"],
+]
+    print(tokenizer.eos_token_id)
+    # reconstruction_test_random(model, dm, device, test_texts)
 
 
 if __name__ == "__main__":
     run_smoke("independent")
-    run_smoke("position", gamma=1.0)
+    run_smoke("position", gamma=0.5)
