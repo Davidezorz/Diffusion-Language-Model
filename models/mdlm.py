@@ -293,6 +293,17 @@ class MaskedDiffusionLM(L.LightningModule):
 
 
     def _forward_pass_diffusion(self, x0):
+        """
+        1. sample diffusion time t
+        2. compute vanilla sigma(t)
+        3. if position mode:
+              compute position-dependent masking probabilities
+           else:
+              compute vanilla masking probabilities
+        4. corrupt x0 into xt
+        5. pass xt to the model
+        6. compute loss against x0
+        """
         B, T = x0.shape
         t = self._sample_t(B, x0.device)
 
@@ -366,12 +377,13 @@ class MaskedDiffusionLM(L.LightningModule):
             - Left positions have lower masking probability
             - Right positions have higher masking probability
 
-        alpha_{t,l} = (1 - t)^{w_l}
+        alpha_{t,l} = exp(-w_l sigma(t))
         p_mask(t,l) = 1 - alpha_{t,l}
         """
 
         B = t.shape[0]
 
+        # normalized positions in [0,1]
         positions = torch.linspace(
             0,
             1,
@@ -383,21 +395,22 @@ class MaskedDiffusionLM(L.LightningModule):
         # w_l=1+gamma(p_t-0.5)
         weights = 1 + self.position_gamma * (positions - 0.5)
         weights = weights.clamp_min(1e-3)
+        # so w(0)=1-gamma/2
+        # w(1)=1+gamma/2
 
-        base = (1 - t[:, None]).clamp_min(1e-5)
-
-        alpha = base ** weights[None, :]
-
+        # schedule a_{t,l} = e^{-w(l) \sigma(t)}
+        sigma, dsigma = self.noise(t)
+        alpha = torch.exp(-sigma[:, None] * weights[None, :])
         move_chance = 1 - alpha
 
         if self.position_loss_weighting:
             loss_weight = (
                     weights[None, :]
-                    * base ** (weights[None, :] - 1)
+                    * dsigma[:, None]
+                    * torch.exp(-sigma[:, None] * weights[None, :])
                     / (1 - alpha).clamp_min(1e-5)
             )
         else:
-            sigma, dsigma = self.noise(t)
             loss_weight = (dsigma / torch.expm1(sigma))[:, None]
 
         return move_chance, loss_weight
