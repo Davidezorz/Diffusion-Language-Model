@@ -6,8 +6,7 @@ import numpy as np
 import torch
 import torchmetrics
 import transformers
-
-import data_processing as dataloader
+import models.masking_schedule as masking_schedule
 from data_processing.samplers import RandomFaultTolerantSampler
 import models.noise_schedule as noise_schedule
 from models.DiT import DiT
@@ -294,53 +293,53 @@ class MaskedDiffusionLM(L.LightningModule):
                     nlls=nlls,
                     token_mask=attention_mask)
 
-
     def _forward_pass_diffusion(self, x0):
-        """
-        1. sample diffusion time t
-        2. compute vanilla sigma(t)
-        3. if position mode:
-              compute position-dependent masking probabilities
-           else:
-              compute vanilla masking probabilities
-        4. corrupt x0 into xt
-        5. pass xt to the model
-        6. compute loss against x0
-        """
         B, T = x0.shape
         t = self._sample_t(B, x0.device)
 
-        sigma, dsigma = self.noise(t)
+        sigma, _ = self.noise(t)
 
-        if self.corruption_type == "position":
-            move_chance, loss_weight = self.position_dependent_noise(
+        if self.corruption_type == "independent":
+            move_chance, loss_weight = masking_schedule.vanilla_masking(
                 t=t,
                 T=T,
-                device=x0.device
+                device=x0.device,
+                noise=self.noise,
+            )
+
+        elif self.corruption_type == "position":
+            move_chance, loss_weight = masking_schedule.position_dependent_masking(
+                t=t,
+                T=T,
+                device=x0.device,
+                noise=self.noise,
+                gamma=self.position_gamma,
+                position_loss_weighting=self.position_loss_weighting,
             )
 
         elif self.corruption_type == "moving_sigmoid":
-            move_chance, loss_weight = self.moving_sigmoid_noise(
+            move_chance, loss_weight = masking_schedule.moving_sigmoid_masking(
                 t=t,
                 T=T,
-                device=x0.device
+                device=x0.device,
+                noise=self.noise,
+                k=self.sigmoid_k,
             )
 
         else:
-            move_chance = 1 - torch.exp(-sigma[:, None])
-            loss_weight = (dsigma / torch.expm1(sigma))[:, None]
+            raise ValueError(f"Unknown corruption type: {self.corruption_type}")
 
         xt = self.q_xt(x0, move_chance)
 
         model_output = self.forward(xt, sigma[:, None])
 
-        # SUBS parameterization, continuous time.
         log_p_theta = torch.gather(
             input=model_output,
             dim=-1,
-            index=x0[:, :, None]).squeeze(-1)
+            index=x0[:, :, None]
+        ).squeeze(-1)
 
-        return - log_p_theta * loss_weight
+        return -log_p_theta * loss_weight
 
 
     def _sample_t(self, B, device):
@@ -354,104 +353,17 @@ class MaskedDiffusionLM(L.LightningModule):
         return t
 
     def q_xt(self, x, p):
-        """
-        Compute noisy sample x_t.
-
-        x : (B,T) clean tokens
-        p : (B,1) or (B,T) masking probability
-        """
-
-        if self.corruption_type == "independent":
+        if self.corruption_type in {"independent", "position", "moving_sigmoid"}:
             return self.q_xt_independent(x, p)
 
-        # since q_xt_independent is equipped of using p as:
-        # - different for every position
-        # - independent bernoulli using p
-        elif self.corruption_type == "position":
-            return self.q_xt_independent(x, p)
-
-
-        elif self.corruption_type == "moving_sigmoid":
-            return self.q_xt_independent(x, p)
-
-        else:
-            raise ValueError(
-                f"Unknown corruption type: {self.corruption_type}"
-            )
+        raise ValueError(f"Unknown corruption type: {self.corruption_type}")
 
 
     # base paper corruption
     def q_xt_independent(self, x, p):
         move_indices = torch.rand(*x.shape, device=x.device) < p
         return torch.where(move_indices, self.mask_index, x)
-    
 
-    def position_dependent_noise(self, t, T, device):
-        """
-        Right-to-left noising:
-            - Left positions have lower masking probability
-            - Right positions have higher masking probability
-
-        alpha_{t,l} = exp(-w_l sigma(t))
-        p_mask(t,l) = 1 - alpha_{t,l}
-        """
-
-        B = t.shape[0]
-
-        # normalized positions in [0,1]
-        positions = torch.linspace(
-            0,
-            1,
-            T,
-            device=device
-        )
-
-        # keep the average corruption closer to the vanilla for the same t -> center weigts in 1
-        # w_l=1+gamma(p_t-0.5)
-        weights = 1 + self.position_gamma * (positions - 0.5)
-        weights = weights.clamp_min(1e-3)
-        # so w(0)=1-gamma/2
-        # w(1)=1+gamma/2
-
-        # schedule a_{t,l} = e^{-w(l) \sigma(t)}
-        sigma, dsigma = self.noise(t)
-        alpha = torch.exp(-sigma[:, None] * weights[None, :])
-        move_chance = 1 - alpha
-
-        if self.position_loss_weighting:
-            loss_weight = (
-                    weights[None, :]
-                    * dsigma[:, None]
-                    * torch.exp(-sigma[:, None] * weights[None, :])
-                    / (1 - alpha).clamp_min(1e-5)
-            )
-        else:
-            loss_weight = (dsigma / torch.expm1(sigma))[:, None]
-
-        return move_chance, loss_weight
-
-    # for small t -> mostly right side masked
-    # for large t -> front moves left
-    def moving_sigmoid_noise(self, t, T, device):
-        """
-        Moving sigmoid right-to-left noising.
-
-       p_mask(t,l) = sigma(k(l + t - 1))
-
-        l in [0,1] (normalized positions)
-        k controls sharpness
-        """
-
-        positions = torch.linspace(0, 1, T, device=device) # normalized position
-        k = self.sigmoid_k
-        logits = k * (positions[None, :] + t[:, None] - 1.0)
-        move_chance = torch.sigmoid(logits)
-
-        # vanilla MDLM loss weighting
-        sigma, dsigma = self.noise(t)
-        loss_weight = (dsigma / torch.expm1(sigma))[:, None]
-
-        return move_chance, loss_weight
 
     def forward(self, x, sigma):
         """Returns log score."""
