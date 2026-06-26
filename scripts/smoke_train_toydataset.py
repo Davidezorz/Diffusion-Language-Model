@@ -232,7 +232,7 @@ def run_smoke(corruption_type, gamma=0.2):
         print("Running on CPU")
 
     trainer = L.Trainer(
-        max_epochs=1000,
+        max_epochs=100,
         limit_train_batches=50,
         accelerator=accelerator,
         devices=1,
@@ -243,10 +243,10 @@ def run_smoke(corruption_type, gamma=0.2):
 
     start = time.time()
 
-    # trainer.fit(
-    #     model,
-    #     train_dataloaders=loader
-    # )
+    trainer.fit(
+        model,
+        train_dataloaders=loader
+    )
 
     print(f"\nTraining time: {time.time() - start:.2f}s")
 
@@ -258,10 +258,10 @@ def run_smoke(corruption_type, gamma=0.2):
     dataset[1]["text"],
     dataset[2]["text"],
 ]
-    print(tokenizer.eos_token_id)
-    # reconstruction_test_random(model, dm, device, test_texts)
+    # print(tokenizer.eos_token_id)
+    reconstruction_test_random(model, dm, device, test_texts)
 
 
 if __name__ == "__main__":
-    run_smoke("independent")
+   # run_smoke("independent")
     run_smoke("position", gamma=0.5)
