@@ -160,7 +160,7 @@ def run_smoke(corruption_type, gamma=0.2):
     "wikitext",
     "wikitext-2-raw-v1",
     cache_dir=caching_directory
-)
+)   
     dataset = dataset["train"].filter(lambda x: len(x["text"].strip()) > 50)
     dataset = dataset.select(range(100))
 
@@ -217,6 +217,10 @@ def run_smoke(corruption_type, gamma=0.2):
     else:
         model.position_loss_weighting = False
 
+    if corruption_type == "moving_sigmoid":
+        model.calibrated_sigmoid = True
+        model.sigmoid_k = 0.5
+
     print("\n==============================")
     print(f"Running: {corruption_type}")
     print(f"Gamma: {gamma}")
@@ -259,6 +263,7 @@ def run_smoke(corruption_type, gamma=0.2):
     dataset[2]["text"],
 ]
     # print(tokenizer.eos_token_id)
+    
     reconstruction_test_random(model, dm, device, test_texts)
 
 

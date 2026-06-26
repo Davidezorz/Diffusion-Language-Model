@@ -21,6 +21,8 @@ def run_smoke(corruption_type, gamma=0.2):
 
     dataset = dataset.rename_column("Text", "text")
 
+    
+
     dm = DataManager(
         caching_directory,
         n_processes=4
@@ -117,5 +119,6 @@ def run_smoke(corruption_type, gamma=0.2):
 
 
 if __name__ == "__main__":
-    run_smoke("independent")
-    run_smoke("position", gamma=0.2)
+    #run_smoke("independent")
+    #run_smoke("position", gamma=0.2)
+    run_smoke("moving_sigmoid")
