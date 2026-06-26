@@ -68,3 +68,29 @@ def test_right_positions_more_masked_than_left():
 
     assert torch.all(right > left)
 
+# test whether masking increases as t increases
+def test_masking_increases_with_t():
+    device = "cpu"
+    T = 128
+    noise = noise_schedule.LogLinearNoise()
+
+    t_low = torch.tensor([0.2], device=device)
+    t_high = torch.tensor([0.8], device=device)
+
+    p_low, _ = moving_sigmoid_masking(
+        t=t_low,
+        T=T,
+        device=device,
+        noise=noise,
+        k=10.0,
+    )
+
+    p_high, _ = moving_sigmoid_masking(
+        t=t_high,
+        T=T,
+        device=device,
+        noise=noise,
+        k=10.0,
+    )
+
+    assert torch.all(p_high > p_low)
