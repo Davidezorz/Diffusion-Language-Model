@@ -46,4 +46,25 @@ def test_probabilities_are_valid():
     assert torch.all(move_chance >= 0)
     assert torch.all(move_chance <= 1)
 
+# test that the probabilities of rightmost tokens being masked is higher
+def test_right_positions_more_masked_than_left():
+    device = "cpu"
+    B = 8
+    T = 128
+
+    t = torch.rand(B, device=device)
+    noise = noise_schedule.LogLinearNoise()
+
+    move_chance, _ = moving_sigmoid_masking(
+        t=t,
+        T=T,
+        device=device,
+        noise=noise,
+        k=10.0,
+    )
+
+    left = move_chance[:, 0]
+    right = move_chance[:, -1]
+
+    assert torch.all(right > left)
 
