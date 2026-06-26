@@ -1,10 +1,9 @@
-# test the shape
-from models.masking_schedule import moving_sigmoid_masking
 
 import torch
 import models.noise_schedule as noise_schedule
 from models.masking_schedule import moving_sigmoid_masking
 
+# test the shape
 def test_shape():
     device = "cpu"
 
@@ -27,4 +26,24 @@ def test_shape():
 
     assert move_chance.shape == (B, T)
     assert loss_weight.shape == (B, 1)
+
+# test that probabilities are between 0 and 1
+def test_probabilities_are_valid():
+    device = "cpu"
+    B = 8
+    T = 128
+
+    t = torch.rand(B, device=device)
+    noise = noise_schedule.LogLinearNoise()
+    move_chance, _ = moving_sigmoid_masking(
+        t=t,
+        T=T,
+        device=device,
+        noise=noise,
+        k=10.0,
+    )
+
+    assert torch.all(move_chance >= 0)
+    assert torch.all(move_chance <= 1)
+
 
