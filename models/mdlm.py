@@ -138,11 +138,14 @@ class MaskedDiffusionLM(L.LightningModule):
         self.fast_forward_batches = None
 
         # toggle for the type of corruption (later, position)
-        self.corruption_type = "independent"  # "independent", "position"
+        self.corruption_type = "independent"  # "independent", "position", "moving_sigmoid"
 
         # position-dependent noising
         self.position_gamma = 2.0
         self.position_loss_weighting = False
+
+        self.sigmoid_k = 10.0
+        self.calibrated_sigmoid = False
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
@@ -315,6 +318,14 @@ class MaskedDiffusionLM(L.LightningModule):
                 T=T,
                 device=x0.device
             )
+
+        elif self.corruption_type == "moving_sigmoid":
+            move_chance, loss_weight = self.moving_sigmoid_noise(
+                t=t,
+                T=T,
+                device=x0.device
+            )
+
         else:
             move_chance = 1 - torch.exp(-sigma[:, None])
             loss_weight = (dsigma / torch.expm1(sigma))[:, None]
@@ -357,6 +368,10 @@ class MaskedDiffusionLM(L.LightningModule):
         # - different for every position
         # - independent bernoulli using p
         elif self.corruption_type == "position":
+            return self.q_xt_independent(x, p)
+
+
+        elif self.corruption_type == "moving_sigmoid":
             return self.q_xt_independent(x, p)
 
         else:
@@ -412,6 +427,29 @@ class MaskedDiffusionLM(L.LightningModule):
             )
         else:
             loss_weight = (dsigma / torch.expm1(sigma))[:, None]
+
+        return move_chance, loss_weight
+
+    # for small t -> mostly right side masked
+    # for large t -> front moves left
+    def moving_sigmoid_noise(self, t, T, device):
+        """
+        Moving sigmoid right-to-left noising.
+
+       p_mask(t,l) = sigma(k(l + t - 1))
+
+        l in [0,1] (normalized positions)
+        k controls sharpness
+        """
+
+        positions = torch.linspace(0, 1, T, device=device) # normalized position
+        k = self.sigmoid_k
+        logits = k * (positions[None, :] + t[:, None] - 1.0)
+        move_chance = torch.sigmoid(logits)
+
+        # vanilla MDLM loss weighting
+        sigma, dsigma = self.noise(t)
+        loss_weight = (dsigma / torch.expm1(sigma))[:, None]
 
         return move_chance, loss_weight
 
