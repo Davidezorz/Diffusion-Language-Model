@@ -143,3 +143,68 @@ def test_larger_k_makes_front_sharper():
     # larger k should create lower probabilities far left and higher probabilities far right
     assert p_sharp[0, 0] < p_soft[0, 0]
     assert p_sharp[0, -1] > p_soft[0, -1]
+
+# test that the mean matches that of the vanilla version
+def test_calibrated_mean_matches_vanilla():
+    device = "cpu"
+    B = 4
+    T = 256
+    k = 10.0
+
+    t = torch.tensor([0.1, 0.3, 0.5, 0.9], device=device)
+    noise = noise_schedule.LogLinearNoise()
+
+    sigma, _ = noise(t)
+    target = 1 - torch.exp(-sigma)
+
+    move_chance, _ = moving_sigmoid_masking(
+        t=t,
+        T=T,
+        device=device,
+        noise=noise,
+        k=k,
+        calibrated=True,
+    )
+
+    mean = move_chance.mean(dim=1)
+
+    assert torch.allclose(mean, target, atol=1e-3)
+
+# test that the rightside is still more masked
+def test_calibrated_right_more_masked():
+    device = "cpu"
+    T = 256
+    t = torch.tensor([0.2, 0.5, 0.8], device=device)
+    noise = noise_schedule.LogLinearNoise()
+
+    move_chance, _ = moving_sigmoid_masking(
+        t=t,
+        T=T,
+        device=device,
+        noise=noise,
+        k=10.0,
+        calibrated=True,
+    )
+
+    assert torch.all(move_chance[:, -1] > move_chance[:, 0])
+
+# test that the mean increases with t
+def test_calibrated_mean_increases_with_t():
+    device = "cpu"
+    T = 256
+    noise = noise_schedule.LogLinearNoise()
+
+    t = torch.tensor([0.1, 0.5, 0.9], device=device)
+
+    move_chance, _ = moving_sigmoid_masking(
+        t=t,
+        T=T,
+        device=device,
+        noise=noise,
+        k=5.0,
+        calibrated=True,
+    )
+
+    means = move_chance.mean(dim=1)
+
+    assert means[0] < means[1] < means[2]

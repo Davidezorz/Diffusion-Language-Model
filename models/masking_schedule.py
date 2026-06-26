@@ -40,6 +40,58 @@ def position_dependent_masking(
 
     return move_chance, loss_weight
 
+def moving_sigmoid_probability(
+    t,
+    T,
+    device,
+    k=10.0,
+    center=None,
+):
+    positions = torch.linspace(0, 1, T, device=device)
+
+    if center is None:
+        center = 1.0 - t
+
+    logits = k * (positions[None, :] - center[:, None])
+    return torch.sigmoid(logits)
+
+def solve_sigmoid_center(
+    target_mean,
+    T,
+    device,
+    k=10.0,
+    steps=30,
+):
+    """
+    Find c such that:
+        mean_l sigmoid(k(l - c)) = target_mean
+
+    target_mean: shape (B,)
+    returns center: shape (B,)
+    """
+
+    low = torch.full_like(target_mean, -1.0)
+    high = torch.full_like(target_mean, 2.0)
+
+    for _ in range(steps):
+        mid = (low + high) / 2
+
+        probs = moving_sigmoid_probability(
+            t=target_mean,      # unused because center is provided
+            T=T,
+            device=device,
+            k=k,
+            center=mid,
+        )
+
+        mean = probs.mean(dim=1)
+
+        # f mean is too high, the front is too far left; increase c to move the front right and reduce masking.
+        low = torch.where(mean > target_mean, mid, low)
+        high = torch.where(mean <= target_mean, mid, high)
+
+    return (low + high) / 2
+
 
 def moving_sigmoid_masking(
     t,
@@ -47,13 +99,30 @@ def moving_sigmoid_masking(
     device,
     noise,
     k=10.0,
+    calibrated=False,
 ):
-    positions = torch.linspace(0, 1, T, device=device)
-
-    logits = k * (positions[None, :] + t[:, None] - 1.0)
-    move_chance = torch.sigmoid(logits)
-
     sigma, dsigma = noise(t)
+
+    vanilla_mean = 1 - torch.exp(-sigma)
+
+    if calibrated:
+        center = solve_sigmoid_center(
+            target_mean=vanilla_mean,
+            T=T,
+            device=device,
+            k=k,
+        )
+    else:
+        center = 1.0 - t
+
+    move_chance = moving_sigmoid_probability(
+        t=t,
+        T=T,
+        device=device,
+        k=k,
+        center=center,
+    )
+
     loss_weight = (dsigma / torch.expm1(sigma))[:, None]
 
     return move_chance, loss_weight

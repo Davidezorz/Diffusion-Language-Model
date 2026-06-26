@@ -324,6 +324,7 @@ class MaskedDiffusionLM(L.LightningModule):
                 device=x0.device,
                 noise=self.noise,
                 k=self.sigmoid_k,
+                calibrated=self.calibrated_sigmoid,
             )
 
         else:
