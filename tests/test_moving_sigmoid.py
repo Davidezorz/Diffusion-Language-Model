@@ -94,3 +94,52 @@ def test_masking_increases_with_t():
     )
 
     assert torch.all(p_high > p_low)
+
+# for the uncalibrated version, we want to see whether the masking mean is not exactly t
+def test_average_masking_not_exactly_equal_to_t():
+    device = "cpu"
+    T = 1000
+    noise = noise_schedule.LogLinearNoise()
+
+    t = torch.tensor([0.1, 0.5, 0.9], device=device)
+
+    move_chance, _ = moving_sigmoid_masking(
+        t=t,
+        T=T,
+        device=device,
+        noise=noise,
+        k=10.0,
+    )
+
+    mean_mask = move_chance.mean(dim=1)
+
+    # the uncalibrated schedule should not be exactly equal to t:
+    assert not torch.allclose(mean_mask, t, atol=1e-3)
+
+# test that k makes the front sharper
+def test_larger_k_makes_front_sharper():
+    device = "cpu"
+    T = 128
+    noise = noise_schedule.LogLinearNoise()
+
+    t = torch.tensor([0.5], device=device)
+
+    p_soft, _ = moving_sigmoid_masking(
+        t=t,
+        T=T,
+        device=device,
+        noise=noise,
+        k=2.0,
+    )
+
+    p_sharp, _ = moving_sigmoid_masking(
+        t=t,
+        T=T,
+        device=device,
+        noise=noise,
+        k=20.0,
+    )
+
+    # larger k should create lower probabilities far left and higher probabilities far right
+    assert p_sharp[0, 0] < p_soft[0, 0]
+    assert p_sharp[0, -1] > p_soft[0, -1]
