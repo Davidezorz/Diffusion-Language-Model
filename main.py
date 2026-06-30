@@ -3,7 +3,7 @@ import torch
 import lightning as L
 
 import matplotlib.pyplot as plt
-import datasets 
+import datasets
 from omegaconf import OmegaConf
 
 from data_processing.data_manager import DataManagerPreTrain, DataManagerQA
@@ -51,7 +51,7 @@ def load_ModernBERTDecoder():
 
 
 def load_shakespeare(caching_directory, print_first_lines=False):
-    dataset = datasets.load_dataset("Trelis/tiny-shakespeare", 
+    dataset = datasets.load_dataset("Trelis/tiny-shakespeare",
                                     cache_dir=caching_directory)
     dataset = dataset.rename_column("Text", "text")
 
@@ -133,7 +133,7 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(
         "jhu-clsp/ettin-decoder-150m",
-    ) 
+    )
 
     # -------------------------------------------------------------------------
     """
@@ -149,7 +149,7 @@ def main():
 
     dataset = load_smoltalk()
 
-    data_manager = DataManagerQA(caching_directory, tokenizer, 
+    data_manager = DataManagerQA(caching_directory, tokenizer,
                                  config.mode, n_processes)
     tokens = data_manager.tokenize(dataset)
     process_tokens = data_manager.group_texts(tokens, config.backbone.T)
@@ -162,7 +162,7 @@ def main():
     # -------------------------------------------------------------------------
     
     sampler_cls = samplers.RandomFaultTolerantSampler
-    train_loader = data_manager.getTrainloader(process_tokens, config.backbone.B, 
+    train_loader = data_manager.getTrainloader(process_tokens, config.backbone.B,
                                                sampler_cls)
 
 
@@ -192,7 +192,7 @@ def main():
     print(f"\n{mode} parameters: {utils.utils.numberOfparameters(backbone)}")
 
     if config.checkpoint is None:
-        model = models[mode](backbone, data_manager.tokenizer, 
+        model = models[mode](backbone, data_manager.tokenizer,
                             T=config.backbone.T).to(device)
     else:
         model = models[mode].load_from_checkpoint(
@@ -201,7 +201,7 @@ def main():
             tokenizer=data_manager.tokenizer,
             T=config.backbone.T,
         ).to(device)
-    
+
 
     print("\n\n")
     try:
@@ -219,7 +219,7 @@ def main():
     """
     print("\ntraining:")
     trainer = L.Trainer(
-        max_epochs=1,  
+        max_epochs=3,  
         accelerator=device,
         devices=1,
         enable_progress_bar=True,
@@ -232,19 +232,19 @@ def main():
         train_dataloaders=train_loader,
         # val_dataloaders=train_loader
     )
-    
-    
+
+
     model.to(device)
     model.eval()
     print('\nmodel testing:')
     #gen = model.generate(start_token.to(device), 200)
     # print(model.tokenizer.decode(gen[0]))
-    
+
 
     # text1 = "User: What is the capital of France?"
     text1 = "User: Can a dog fly?"
     text2 = "Assistant: "
-        
+
     tokenizer_kwargs = {'return_tensors': "pt", 'add_special_tokens': False}
     input1 = tokenizer(text1, **tokenizer_kwargs)['input_ids']
     input2 = tokenizer(text2, **tokenizer_kwargs)['input_ids']

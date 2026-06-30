@@ -136,6 +136,7 @@ class MultiHeadAttention(nn.Module):
 
         # attention function choice
         self.attention = self._attention_sdpa
+        print("Flash attention imported: ", flash_attn_imported)
 
         cuda_available = torch.cuda.is_available()
         if cuda_available and torch.cuda.get_device_capability()[0] >= 8 \
@@ -208,12 +209,15 @@ class MultiHeadAttention(nn.Module):
         flash_fn = self._flash_attn_seqlens if available else self._flash_attn
         x = flash_fn(qkv, seqlens, B, T, device)
         
+
         return rearrange(x, '(B T) H c -> B T (H c)', B=B)                      # B T C
 
 
     def _flash_attn(self, qkv, seqlens, B, T, device):
         int32 = torch.int32
         cu_seqlens = torch.arange(0, (B+1)*T, T, dtype=int32, device=device)
+
+        raise Exception
 
         x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(   #   ╭ compute attention
             qkv, cu_seqlens, T, 0., causal=self.is_causal)                      # ◀─╯ (B T) 3 H c

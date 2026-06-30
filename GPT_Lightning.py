@@ -45,7 +45,7 @@ class  GPT(L.LightningModule):
             betas =(0.9, 0.999),
             eps   = 1e-8,
             weight_decay = 0)
-        
+
         scheduler = transformers.get_constant_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=2500
@@ -112,7 +112,7 @@ class  GPT(L.LightningModule):
         B, T = inputs.shape
         if seqlens is not None:
             seqlens = seqlens.sum(dim=-1) if seqlens.sum() != B*T else None
-        
+
         logits = self.backbone(inputs, None) # TODO: is sqlens helpful?
         B, T, V = logits.shape
 
@@ -120,7 +120,7 @@ class  GPT(L.LightningModule):
         targets = outputs.view(B*T)
 
         # Ignore -100: This ignores both PAD tokens and the User's prompts!
-        loss = F.cross_entropy(logits, 
+        loss = F.cross_entropy(logits,
                             targets,
                             ignore_index=-100)
         return loss
@@ -192,24 +192,24 @@ class  GPT(L.LightningModule):
         B = ids.shape[0]
         # Track which sequences in the batch are still generating
         unfinished = torch.ones(B, dtype=torch.bool, device=ids.device)
-        
+
         for _ in range(n_tokens):
             logits = self.backbone(ids)                                         # get the logits
             logits = logits[:, -1, :]                                           # B C
 
             probs = F.softmax(logits/temperature, dim=-1)                       # apply softmax to get probabilities
             id_next = torch.multinomial(probs, num_samples=1)                   # B 1
-            
+
             # If a sequence is already finished, force its next token to be EOS
             id_next[~unfinished] = self.tokenizer.eos_token_id
-            
+
             ids = torch.cat((ids, id_next), dim=1)                              # B T+1
-            
+
             # Update unfinished mask: turn to False if EOS is generated
             unfinished = unfinished & (id_next.squeeze(-1) != self.tokenizer.eos_token_id)
-            
+
             # Break early only if ALL sequences in the batch are finished
             if not unfinished.any():
                 break
-                
+
         return ids

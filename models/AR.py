@@ -82,7 +82,7 @@ class AR(BaseModel):
             logits = logits[:, -1, :]                                           # B C
 
             sorted_idx= torch.argsort(-logits)
-            print(tokenizer.decode(sorted_idx[:, :5]))
+            print(tokenizer.decode(sorted_idx[0, :5].tolist()))
             probs = F.softmax(logits/temperature, dim=-1)                       # apply softmax to get probabilities
             
             id_next = torch.multinomial(probs, num_samples=1)                   # B 1  -> sample from the distribution

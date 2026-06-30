@@ -307,5 +307,6 @@ def run_smoke(corruption_type, gamma=0.2):
 
 if __name__ == "__main__":
     run_smoke("moving_sigmoid")
+    run_smoke("position", gamma=0.3)
     run_smoke("independent")
-    run_smoke("position", gamma=0.5)
+    
