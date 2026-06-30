@@ -1,0 +1,11 @@
+mode: "AR"
+caching_directory: '.data/'
+
+
+backbone:
+    B: 6                            # ◀ batch dimension
+    T: 256                          # ◀ context window (max sequence length)
+    C: 768                          # ◀ embedding dimension
+    N: 22                           # ◀ number of blocks
+    H: 12                           # ◀ number of heads
+

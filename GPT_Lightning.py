@@ -45,7 +45,6 @@ class  GPT(L.LightningModule):
             eps   = 1e-8,
             weight_decay = 0)
         
-        """
         scheduler = transformers.get_constant_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=2500
@@ -57,7 +56,7 @@ class  GPT(L.LightningModule):
             end_factor=0.1,
             total_iters=2500
         )
-
+        """
         scheduler_dict = {
             'scheduler': scheduler,
             'interval': 'step',
@@ -104,8 +103,30 @@ class  GPT(L.LightningModule):
         return loss        
 
 
+    def loss_qa(self, batch):
+        inputs  = batch['input_ids']
+        outputs = batch['output_ids']
+        seqlens = batch.get('attention_mask')
+
+        B, T = inputs.shape
+        if seqlens is not None:
+            seqlens = seqlens.sum(dim=-1) if seqlens.sum() != B*T else None
+        
+        logits = self.backbone(inputs, seqlens)
+        B, T, V = logits.shape
+
+        logits  = logits.view(B*T, V)
+        targets = outputs.view(B*T)
+
+        # Ignore -100: This ignores both PAD tokens and the User's prompts!
+        loss = F.cross_entropy(logits, 
+                            targets,
+                            ignore_index=-100)
+        return loss
+
+
     def validation_step(self, batch, batch_idx):
-        loss = self.loss(batch)
+        loss = self.loss_qa(batch)
 
         self.log('val/loss', loss, on_step=False,
                  on_epoch=True, sync_dist=True)
@@ -115,6 +136,7 @@ class  GPT(L.LightningModule):
 
 
     def on_validation_epoch_end(self):
+        pass
         x = torch.full((4, 1), self.tokenizer.bos_token_id, device=self.device)
         samples = self.generate(x, n_tokens=50)
         decoded_samples = self.tokenizer.batch_decode(samples, skip_special_tokens=True)
@@ -150,7 +172,7 @@ class  GPT(L.LightningModule):
             del state_dict[k]                                                   # checkpoint dictionary
 
 
-    def generate(self, ids, n_tokens, temperature=1):
+    def generate_(self, ids, n_tokens, temperature=1):
         for _ in range(n_tokens):
             
             logits = self.backbone(ids)                                         # get the logits
@@ -162,3 +184,29 @@ class  GPT(L.LightningModule):
             ids = torch.cat((ids, id_next), dim=1)                              # B T+1
         return ids
 
+
+    def generate(self, ids, n_tokens, temperature=1):
+        B = ids.shape[0]
+        # Track which sequences in the batch are still generating
+        unfinished = torch.ones(B, dtype=torch.bool, device=ids.device)
+        
+        for _ in range(n_tokens):
+            logits = self.backbone(ids)                                         # get the logits
+            logits = logits[:, -1, :]                                           # B C
+
+            probs = F.softmax(logits/temperature, dim=-1)                       # apply softmax to get probabilities
+            id_next = torch.multinomial(probs, num_samples=1)                   # B 1
+            
+            # If a sequence is already finished, force its next token to be EOS
+            id_next[~unfinished] = self.tokenizer.eos_token_id
+            
+            ids = torch.cat((ids, id_next), dim=1)                              # B T+1
+            
+            # Update unfinished mask: turn to False if EOS is generated
+            unfinished = unfinished & (id_next.squeeze(-1) != self.tokenizer.eos_token_id)
+            
+            # Break early only if ALL sequences in the batch are finished
+            if not unfinished.any():
+                break
+                
+        return ids
