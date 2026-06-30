@@ -353,18 +353,19 @@ class MaskedDiffusionLM(L.LightningModule):
         t = (1 - self.sampling_eps) * sample + self.sampling_eps
         return t
 
-    def q_xt(self, x, p):
-        if self.corruption_type in {"independent", "position", "moving_sigmoid"}:
-            return self.q_xt_independent(x, p)
+    def q_xt(self, x, p, noise_mask=None):
+        """
+        Apply masking corruption:
+        x:          (B, T) clean token ids
+        p:          (B, 1) or (B, T) masking probability
+        noise_mask: optional boolean mask (B, T): if provided, only positions where noise_mask=True can be masked (i.e. no CTX tokens)
+        """
+        move_indices = torch.rand(x.shape, device=x.device) < p
 
-        raise ValueError(f"Unknown corruption type: {self.corruption_type}")
+        if noise_mask is not None:
+            move_indices = move_indices & noise_mask.bool()
 
-
-    # base paper corruption
-    def q_xt_independent(self, x, p):
-        move_indices = torch.rand(*x.shape, device=x.device) < p
         return torch.where(move_indices, self.mask_index, x)
-
 
     def forward(self, x, sigma):
         """Returns log score."""
