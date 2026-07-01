@@ -230,13 +230,13 @@ class MaskedDiffusionLM(L.LightningModule):
     def training_step(self, batch, batch_idx):
 
         input_ids = self._ensure_batch_tensor(batch["input_ids"])
-
+        output_ids = self._ensure_batch_tensor(batch["output_ids"])
         attention_mask = batch["attention_mask"] if "attention_mask" in batch else None
 
         if attention_mask is not None:
             attention_mask = self._ensure_batch_tensor(attention_mask)
 
-        losses = self._loss(input_ids, attention_mask)
+        losses = self._loss(input_ids, output_ids, attention_mask)
         loss = losses.loss
 
         if not hasattr(self, "_running_losses"):
@@ -273,29 +273,89 @@ class MaskedDiffusionLM(L.LightningModule):
         return loss
 
 
-    def _loss(self, x0, attention_mask):
-        B, T = x0.shape
+    def _loss(self, input_ids, output_ids, attention_mask):
+        """
+        computes the final diffusion training loss for a batch:
+        1. crop the sequence if it exceeds the configured context length
+        2. build the supervision mask from output_ids
+           (output_ids != -100)
+        3. use the same mask as the noise mask, so that only prediction
+           tokens are corrupted by the forward process
+        4. call _forward_pass_diffusion() to obtain the per-token
+           diffusion loss
+        5. ignore tokens that should not contribute to the objective
+           (context and padding)
+        6. average the remaining token losses and return the Loss object
+
+        The ingredients are:
+            input_ids  -> what the model receives.
+            output_ids -> what the model should reconstruct.
+            attention_mask -> identifies real tokens (vs padding).
+            noise_mask -> identifies which tokens may be corrupted.
+            loss_mask -> identifies which tokens contribute to the loss.
+
+        In the conversational setting: noise_mask == loss_mask == (output_ids != -100),
+        while attention_mask is only used to ignore padding
+        """
+        B, T = input_ids.shape
 
         if T > self.T:
             assert T == 2 * self.T
             start = np.random.choice(self.T)
-            x0 = x0[:, start:start + self.T]
 
-        loss = self._forward_pass_diffusion(x0)
+            input_ids = input_ids[:, start:start + self.T]
+            output_ids = output_ids[:, start:start + self.T]
 
-        nlls = loss * attention_mask
-        count = attention_mask.sum()
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, start:start + self.T]
 
-        batch_nll = nlls.sum()
-        token_nll = batch_nll / count
+        # we do not compute the loss on PAD and CTX
+        loss_mask = output_ids != -100
 
-        return Loss(loss=token_nll,
-                    nlls=nlls,
-                    token_mask=attention_mask)
+        if attention_mask is not None:
+            loss_mask = loss_mask & attention_mask.bool()
 
-    def _forward_pass_diffusion(self, x0):
-        B, T = x0.shape
-        t = self._sample_t(B, x0.device)
+        # noise_mask == loss_mask
+        loss = self._forward_pass_diffusion(
+            input_ids=input_ids,
+            output_ids=output_ids,
+            noise_mask=loss_mask,
+        )
+
+        nlls = loss * loss_mask
+        count = loss_mask.sum().clamp_min(1)
+
+        token_nll = nlls.sum() / count
+
+        return Loss(
+            loss=token_nll,
+            nlls=nlls,
+            token_mask=loss_mask,
+        )
+
+
+    def _forward_pass_diffusion(self, input_ids, output_ids, noise_mask=None):
+        """
+        performs one forward diffusion training step:
+
+        1. sample a diffusion timestep t
+        2. use the masking schedule (independent, position-dependent,
+           moving sigmoid) to compute:
+              - move_chance: masking probability for each token
+              - loss_weight: analytical weighting required by MDLM
+        3. apply q_xt() to corrupt the input sequence according to
+           move_chance and the provided noise_mask
+        4. feed the corrupted sequence to the DiT denoiser together
+           with the noise level sigma(t)
+        5. gather the log-probability assigned to the target tokens
+           (output_ids)
+        6. return the per-token weighted negative log-likelihood
+
+        it returns a tensor of shape (B, T), leaving masking and averaging
+        to _loss().
+        """
+        B, T = input_ids.shape
+        t = self._sample_t(B, input_ids.device)
 
         sigma, _ = self.noise(t)
 
@@ -303,7 +363,7 @@ class MaskedDiffusionLM(L.LightningModule):
             move_chance, loss_weight = masking_schedule.vanilla_masking(
                 t=t,
                 T=T,
-                device=x0.device,
+                device=input_ids.device,
                 noise=self.noise,
             )
 
@@ -311,7 +371,7 @@ class MaskedDiffusionLM(L.LightningModule):
             move_chance, loss_weight = masking_schedule.position_dependent_masking(
                 t=t,
                 T=T,
-                device=x0.device,
+                device=input_ids.device,
                 noise=self.noise,
                 gamma=self.position_gamma,
                 position_loss_weighting=self.position_loss_weighting,
@@ -321,7 +381,7 @@ class MaskedDiffusionLM(L.LightningModule):
             move_chance, loss_weight = masking_schedule.moving_sigmoid_masking(
                 t=t,
                 T=T,
-                device=x0.device,
+                device=input_ids.device,
                 noise=self.noise,
                 k=self.sigmoid_k,
                 calibrated=self.calibrated_sigmoid,
@@ -330,14 +390,22 @@ class MaskedDiffusionLM(L.LightningModule):
         else:
             raise ValueError(f"Unknown corruption type: {self.corruption_type}")
 
-        xt = self.q_xt(x0, move_chance)
+        xt = self.q_xt(
+            input_ids,
+            move_chance,
+            noise_mask=noise_mask,
+        )
 
         model_output = self.forward(xt, sigma[:, None])
+
+        # replace ignored targets with a safe dummy index:
+        safe_output_ids = output_ids.clone()
+        safe_output_ids[safe_output_ids == -100] = 0
 
         log_p_theta = torch.gather(
             input=model_output,
             dim=-1,
-            index=x0[:, :, None]
+            index=safe_output_ids[:, :, None],
         ).squeeze(-1)
 
         return -log_p_theta * loss_weight
@@ -353,9 +421,10 @@ class MaskedDiffusionLM(L.LightningModule):
         t = (1 - self.sampling_eps) * sample + self.sampling_eps
         return t
 
+
     def q_xt(self, x, p, noise_mask=None):
         """
-        Apply masking corruption:
+        apply masking corruption:
         x:          (B, T) clean token ids
         p:          (B, 1) or (B, T) masking probability
         noise_mask: optional boolean mask (B, T): if provided, only positions where noise_mask=True can be masked (i.e. no CTX tokens)
@@ -367,6 +436,7 @@ class MaskedDiffusionLM(L.LightningModule):
 
         return torch.where(move_indices, self.mask_index, x)
 
+
     def forward(self, x, sigma):
         """Returns log score."""
         if sigma.ndim > 1:
@@ -375,6 +445,7 @@ class MaskedDiffusionLM(L.LightningModule):
         logits = self.denoiser(x, sigma)
 
         return self._subs_parameterization(logits=logits, xt=x)
+
 
     def _subs_parameterization(self, logits, xt):
         # log prob at the mask index = - infinity

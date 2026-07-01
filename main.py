@@ -219,7 +219,7 @@ def main():
     """
     print("\ntraining:")
     trainer = L.Trainer(
-        max_epochs=3,  
+        max_epochs=3,
         accelerator=device,
         devices=1,
         enable_progress_bar=True,
