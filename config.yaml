@@ -1,10 +1,10 @@
 mode: "AR"
 caching_directory: '.data/'
-
+checkpoint: "lightning_logs/version_10/checkpoints/epoch=0-step=175.ckpt"
 
 backbone:
     B: 6                            # ◀ batch dimension
-    T: 256                          # ◀ context window (max sequence length)
+    T: 384                          # ◀ context window (max sequence length)
     C: 768                          # ◀ embedding dimension
     N: 22                           # ◀ number of blocks
     H: 12                           # ◀ number of heads

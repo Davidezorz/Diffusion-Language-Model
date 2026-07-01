@@ -25,7 +25,7 @@ class  GPT(L.LightningModule):
         self.vocab_size = self.tokenizer.vocab_size
 
         self.backbone = backbone
-
+        """
         # For Generative PPL (External Model)
         self.eval_tokenizer = AutoTokenizer.from_pretrained(gen_ppl_model_id)
         self.eval_model = AutoModelForCausalLM.from_pretrained(gen_ppl_model_id)
@@ -35,6 +35,7 @@ class  GPT(L.LightningModule):
         self.eval_model.eval()
         for p in self.eval_model.parameters():
             p.requires_grad = False
+        """
 
 
     def configure_optimizers(self):
@@ -112,7 +113,7 @@ class  GPT(L.LightningModule):
         if seqlens is not None:
             seqlens = seqlens.sum(dim=-1) if seqlens.sum() != B*T else None
         
-        logits = self.backbone(inputs, seqlens)
+        logits = self.backbone(inputs, None) # TODO: is sqlens helpful?
         B, T, V = logits.shape
 
         logits  = logits.view(B*T, V)
@@ -136,7 +137,7 @@ class  GPT(L.LightningModule):
 
 
     def on_validation_epoch_end(self):
-        pass
+        return
         x = torch.full((4, 1), self.tokenizer.bos_token_id, device=self.device)
         samples = self.generate(x, n_tokens=50)
         decoded_samples = self.tokenizer.batch_decode(samples, skip_special_tokens=True)
@@ -172,6 +173,7 @@ class  GPT(L.LightningModule):
             del state_dict[k]                                                   # checkpoint dictionary
 
 
+    @torch.no_grad()
     def generate_(self, ids, n_tokens, temperature=1):
         for _ in range(n_tokens):
             
@@ -185,6 +187,7 @@ class  GPT(L.LightningModule):
         return ids
 
 
+    @torch.no_grad()
     def generate(self, ids, n_tokens, temperature=1):
         B = ids.shape[0]
         # Track which sequences in the batch are still generating

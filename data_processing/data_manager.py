@@ -137,6 +137,15 @@ import os
 
 class DataManagerQA(DataManagerPreTrain):
 
+    def __init__(self, caching_directory, tokenizer, 
+                 mode: str ='AR', n_processes: int = 1):
+        super().__init__(caching_directory, tokenizer, n_processes)
+        group_fn_dict = {'AR':   self.group_texts_ar,
+                         'BERT': self.group_texts_dit,
+                         'DiT':  self.group_texts_dit
+}
+        self.group_texts = group_fn_dict[mode]
+
     def _tokenize(self, dataset):
         """ Tokeinze the conversion, in question and answer split """
         tokenizer = self.tokenizer
