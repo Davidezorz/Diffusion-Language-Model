@@ -309,13 +309,32 @@ class MaskedDiffusionLM(L.LightningModule):
             if attention_mask is not None:
                 attention_mask = attention_mask[:, start:start + self.T]
 
-        # we do not compute the loss on PAD and CTX
         loss_mask = output_ids != -100
+
+        if not hasattr(self, "_debug_loss_mask_printed"):
+            self._debug_loss_mask_printed = True
+
+            print("\n[DEBUG loss mask]")
+            print("input_ids shape:", input_ids.shape)
+            print("output_ids shape:", output_ids.shape)
+            print("attention_mask shape:", None if attention_mask is None else attention_mask.shape)
+
+            print("loss positions:", loss_mask.sum().item())
+            print("total positions:", loss_mask.numel())
+            print("loss ratio:", loss_mask.float().mean().item())
+
+            print("first output_ids:")
+            print(output_ids[0].tolist())
+
+            print("first loss_mask:")
+            print(loss_mask[0].int().tolist())
+
+            print("tokens with loss:")
+            print(self.tokenizer.decode(output_ids[0][loss_mask[0]].tolist()))
 
         if attention_mask is not None:
             loss_mask = loss_mask & attention_mask.bool()
 
-        # noise_mask == loss_mask
         loss = self._forward_pass_diffusion(
             input_ids=input_ids,
             output_ids=output_ids,
@@ -324,7 +343,6 @@ class MaskedDiffusionLM(L.LightningModule):
 
         nlls = loss * loss_mask
         count = loss_mask.sum().clamp_min(1)
-
         token_nll = nlls.sum() / count
 
         return Loss(
@@ -332,7 +350,6 @@ class MaskedDiffusionLM(L.LightningModule):
             nlls=nlls,
             token_mask=loss_mask,
         )
-
 
     def _forward_pass_diffusion(self, input_ids, output_ids, noise_mask=None):
         """
@@ -366,7 +383,6 @@ class MaskedDiffusionLM(L.LightningModule):
                 device=input_ids.device,
                 noise=self.noise,
             )
-
         elif self.corruption_type == "position":
             move_chance, loss_weight = masking_schedule.position_dependent_masking(
                 t=t,
@@ -376,7 +392,6 @@ class MaskedDiffusionLM(L.LightningModule):
                 gamma=self.position_gamma,
                 position_loss_weighting=self.position_loss_weighting,
             )
-
         elif self.corruption_type == "moving_sigmoid":
             move_chance, loss_weight = masking_schedule.moving_sigmoid_masking(
                 t=t,
@@ -386,7 +401,6 @@ class MaskedDiffusionLM(L.LightningModule):
                 k=self.sigmoid_k,
                 calibrated=self.calibrated_sigmoid,
             )
-
         else:
             raise ValueError(f"Unknown corruption type: {self.corruption_type}")
 
@@ -398,7 +412,6 @@ class MaskedDiffusionLM(L.LightningModule):
 
         model_output = self.forward(xt, sigma[:, None])
 
-        # replace ignored targets with a safe dummy index:
         safe_output_ids = output_ids.clone()
         safe_output_ids[safe_output_ids == -100] = 0
 
@@ -430,6 +443,15 @@ class MaskedDiffusionLM(L.LightningModule):
         noise_mask: optional boolean mask (B, T): if provided, only positions where noise_mask=True can be masked (i.e. no CTX tokens)
         """
         move_indices = torch.rand(x.shape, device=x.device) < p
+
+        if not hasattr(self, "_debug_noise_printed"):
+            self._debug_noise_printed = True
+
+            print("\n[DEBUG q_xt]")
+            print("possible mask positions:", noise_mask.sum().item())
+            print("actually masked positions:", move_indices.sum().item())
+            print("masked outside noise_mask:",
+                  (move_indices & ~noise_mask.bool()).sum().item())
 
         if noise_mask is not None:
             move_indices = move_indices & noise_mask.bool()
