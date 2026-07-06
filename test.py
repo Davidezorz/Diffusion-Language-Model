@@ -107,7 +107,7 @@ def test_model(model, tokenizer, mode):
     inputs = torch.cat([BOS, input1, EOS, BOS, input2], dim=-1)
     print(inputs.shape)
     print(inputs)
-    print(tokenizer.decode(inputs))
+    print(tokenizer.decode(inputs[0].tolist()))
     print("\n\n")
 
     if mode == "AR":
@@ -115,5 +115,5 @@ def test_model(model, tokenizer, mode):
                                 temperature=0.5, tokenizer=tokenizer)
     else:
         output = model.generate(inputs, mask_id=tokenizer.mask_token_id)
-    print(tokenizer.decode(output))
+    print(tokenizer.decode(output[0].tolist()))
 

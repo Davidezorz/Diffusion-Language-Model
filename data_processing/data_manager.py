@@ -27,7 +27,7 @@ class DataManagerPreTrain():
         if self.tokenizer.mask_token is None:
             self.tokenizer.add_special_tokens({'mask_token': '<MASK>'})
             
-        self.vocab_size = self.tokenizer.vocab_size
+        self.vocab_size = len(self.tokenizer)
 
 
     def _tokenize(self, dataset):

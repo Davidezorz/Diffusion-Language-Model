@@ -88,20 +88,25 @@ class  GPT(L.LightningModule):
         outputs = batch['output_ids']
         seqlens = batch.get('attention_mask')
 
-        B, T = batch['input_ids'].shape
+        B, T = inputs.shape
+
         if seqlens is not None:
             seqlens = seqlens.sum(dim=-1) if seqlens.sum() != B*T else None
-        
+
         logits = self.backbone(inputs, seqlens)
         B, T, V = logits.shape
 
-        logits  = logits.view(B*T, V)
-        targets = outputs.view(B*T)
+        targets = outputs.clone()
+        targets[(targets < 0) & (targets != -100)] = -100
+        targets[targets >= V] = -100
 
-        loss = F.cross_entropy(logits, 
-                               targets,
-                               ignore_index=self.tokenizer.pad_token_id)
-        return loss        
+        loss = F.cross_entropy(
+            logits.reshape(-1, V),
+            targets.reshape(-1),
+            ignore_index=-100
+        )
+
+        return loss  
 
 
     def loss_qa(self, batch):
@@ -110,19 +115,25 @@ class  GPT(L.LightningModule):
         seqlens = batch.get('attention_mask')
 
         B, T = inputs.shape
+
         if seqlens is not None:
             seqlens = seqlens.sum(dim=-1) if seqlens.sum() != B*T else None
 
-        logits = self.backbone(inputs, None) # TODO: is sqlens helpful?
+        logits = self.backbone(inputs, seqlens)
         B, T, V = logits.shape
 
-        logits  = logits.view(B*T, V)
-        targets = outputs.view(B*T)
+        targets = outputs.clone()
 
-        # Ignore -100: This ignores both PAD tokens and the User's prompts!
-        loss = F.cross_entropy(logits,
-                            targets,
-                            ignore_index=-100)
+        # ignore everything not valid for CrossEntropy
+        targets[(targets < 0) & (targets != -100)] = -100
+        targets[targets >= V] = -100
+
+        loss = F.cross_entropy(
+            logits.reshape(-1, V),
+            targets.reshape(-1),
+            ignore_index=-100
+        )
+
         return loss
 
 

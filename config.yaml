@@ -1,11 +1,30 @@
-mode: "AR"
+mode: "DiT"   # AR | DiT
 caching_directory: '.data/'
-checkpoint: "lightning_logs/version_10/checkpoints/epoch=0-step=175.ckpt"
+checkpoint: 
 
 backbone:
-    B: 6                            # ◀ batch dimension
-    T: 384                          # ◀ context window (max sequence length)
+    B: 1                            # ◀ batch dimension
+    T: 2048                        # ◀ context window (max sequence length)
+    T_ctx: 1792
+    T_ans: 256
     C: 768                          # ◀ embedding dimension
     N: 22                           # ◀ number of blocks
     H: 12                           # ◀ number of heads
+
+training:
+    max_epochs: 20
+    limit_train_batches: 20
+    log_every_n_steps: 10
+    debug_subset_size: 20
+
+diffusion:
+    noise_schedule: "loglinear"
+    
+    corruption_type: "moving_sigmoid"      # independent | position | moving_sigmoid
+    position_gamma: 0.2
+    position_loss_weighting: false
+
+    sigmoid_k: 5
+    calibrated_sigmoid: true
+    
 

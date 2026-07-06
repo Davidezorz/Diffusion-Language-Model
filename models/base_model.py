@@ -177,11 +177,18 @@ class MultiHeadAttention(nn.Module):
         qkv = rearrange(qkv, 'B T three H c -> three B H T c')
         q, k, v = qkv.unbind(dim=0)                                             # B three H S c -> 3 * B H T c
         
-        mask, causal_mask = None, 0
-        if seqlens is not None:                                                # ◀── handle sequence length
-            if is_causal: causal_mask = self._create_causal_mask(T, q.device)  # ◀─┤ T T
-            mask_seqlen = self._create_seqlens_mask(seqlens, T, q.device)       
-            mask =  ~(causal_mask | mask_seqlen).unsqueeze(1)
+        mask = None
+
+        if seqlens is not None:
+            mask_seqlen = self._create_seqlens_mask(seqlens, T, q.device)
+
+            if is_causal:
+                causal_mask = self._create_causal_mask(T, q.device)
+                mask = ~(causal_mask | mask_seqlen).unsqueeze(1)
+            else:
+                mask = ~mask_seqlen.unsqueeze(1)
+
+            mask = mask.bool()
             is_causal = False
 
         x = F.scaled_dot_product_attention(

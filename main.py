@@ -6,6 +6,8 @@ import matplotlib.pyplot as plt
 import datasets
 from omegaconf import OmegaConf
 
+import models.masking_schedule as masking_schedule
+import models.noise_schedule as noise_schedule
 from data_processing.data_manager import DataManagerPreTrain, DataManagerQA
 import utils.utils
 
@@ -29,7 +31,7 @@ from models.base_model import *
 
 from utils.transfer_weights import *
 import test
-
+from lightning.pytorch.callbacks import ModelCheckpoint
 
 
 def load_ModernBERT():
@@ -116,6 +118,8 @@ def count_pad(process_tokens, tokenizer):
 # ╰───────────────────────────────────────────────────────────────────────────╯
 
 def main():
+    torch.set_float32_matmul_precision("high") # for CUDA
+
     print('main online\n')
     config = OmegaConf.load("config.yaml")                                      # get the config
     mode   = config.mode
@@ -152,13 +156,23 @@ def main():
     data_manager = DataManagerQA(caching_directory, tokenizer,
                                  config.mode, n_processes)
     tokens = data_manager.tokenize(dataset)
-    process_tokens = data_manager.group_texts(tokens, config.backbone.T)
+    if mode == "AR":
+        process_tokens = data_manager.group_texts(tokens, config.backbone.T)
+    else:
+        process_tokens = data_manager.group_texts(
+            tokens,
+            config.backbone.T_ctx,
+            config.backbone.T_ans
+        )
 
-    # process_tokens = process_tokens.select(range(50))                         # uncomment here if you want a chunked dataset
-    process_tokens = process_tokens.with_format('torch')
+    debug_subset_size = config.training.get("debug_subset_size", None)
+
+    if debug_subset_size is not None:
+        process_tokens = process_tokens.select(range(debug_subset_size))                      # uncomment here if you want a chunked dataset
+        process_tokens = process_tokens.with_format('torch')
 
     print_token_examples(process_tokens, tokenizer)
-
+    
     # -------------------------------------------------------------------------
     
     sampler_cls = samplers.RandomFaultTolerantSampler
@@ -202,6 +216,20 @@ def main():
             T=config.backbone.T,
         ).to(device)
 
+    if mode in ["BERT", "DiT"]:
+        noise_name = config.diffusion.get("noise_schedule", "loglinear")
+        if noise_name == "loglinear":
+            model.noise = noise_schedule.LogLinearNoise()
+        else:
+            raise ValueError(f"Unknown noise schedule: {noise_name}")
+        model.corruption_type = config.diffusion.get("corruption_type", "independent")
+        model.position_gamma = config.diffusion.get("position_gamma", 2.0)
+        model.position_loss_weighting = config.diffusion.get("position_loss_weighting", False)
+        model.sigmoid_k = config.diffusion.get("sigmoid_k", 10.0)
+        model.calibrated_sigmoid = config.diffusion.get("calibrated_sigmoid", False)
+
+    if config.checkpoint is not None:
+        print(f"Loaded checkpoint from: {config.checkpoint}")
 
     print("\n\n")
     try:
@@ -209,23 +237,38 @@ def main():
     except:
         pass
 
-    print('\nmodel testing:')
-    start_token = tokenizer(tokenizer.bos_token, return_tensors="pt", 
-                            add_special_tokens=False)['input_ids']
-    gen = model.generate(start_token.to(device), 100)
-    print(model.tokenizer.decode(gen[0]))
+    if mode == "AR":
+        print('\nmodel testing:')
+        start_token = tokenizer(tokenizer.bos_token, return_tensors="pt",
+                                add_special_tokens=False)['input_ids']
+        gen = model.generate(start_token.to(device), 100)
+        print(model.tokenizer.decode(gen[0]))
 
     """
     """
+    checkpoint_callback = ModelCheckpoint(
+        dirpath="checkpoints",
+        filename=f"{mode}-{config.diffusion.corruption_type}" + "-{epoch:02d}-{trainer/loss:.4f}",
+        monitor="trainer/loss",
+        save_top_k=2,
+        mode="min",
+        save_last=True,
+    )
+
     print("\ntraining:")
     trainer = L.Trainer(
-        max_epochs=3,
+        max_epochs=config.training.max_epochs,
         accelerator=device,
         devices=1,
         enable_progress_bar=True,
-        log_every_n_steps=10  # Log to console every 10 steps
+        limit_train_batches=config.training.limit_train_batches,
+        log_every_n_steps=config.training.log_every_n_steps,
+        callbacks=[checkpoint_callback],
     )
 
+
+    model.train()
+    model.backbone.train()
 
     trainer.fit(
         model=model, 
@@ -253,7 +296,7 @@ def main():
     EOS = torch.tensor([[tokenizer.eos_token_id]]).expand(1, -1)
 
     inputs = torch.cat([BOS, input1, EOS, input2], dim=-1)
-    gen = model.generate(inputs.to(device), 200, temperature=0.5)
+    gen = model.generate(inputs.to(device), 50, temperature=0.5)
     print(model.tokenizer.decode(gen[0]))
 
 
@@ -264,13 +307,13 @@ if __name__ == '__main__':
     main()
     # smoltalk = load_smoltalk()
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        "jhu-clsp/ettin-decoder-150m",
-    )
-    #test.test_smoltalk(smoltalk, tokenizer)
+    # tokenizer = AutoTokenizer.from_pretrained(
+    #     "jhu-clsp/ettin-decoder-150m",
+    # )
+    # test.test_smoltalk(smoltalk, tokenizer)
 
-    print("Special Tokens:")
-    for token in tokenizer.all_special_tokens:
-        token_encoded=tokenizer(token, add_special_tokens=False)
-        print(f"{token: <8} --> {token_encoded['input_ids']}")
+    # print("Special Tokens:")
+    # for token in tokenizer.all_special_tokens:
+    #     token_encoded=tokenizer(token, add_special_tokens=False)
+    #     print(f"{token: <8} --> {token_encoded['input_ids']}")
 

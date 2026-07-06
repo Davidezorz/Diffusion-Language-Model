@@ -1,7 +1,7 @@
 # weights and logs
 .weights/
 lightning_logs/
-
+checkpoints/
 
 # markdown
 project.md
