@@ -13,6 +13,13 @@ from diffusion_lightning import Diffusion
 import data_processing.samplers as samplers
 from utils.transfer_weights import *
 import test
+import torch
+
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForMaskedLM,
+    AutoTokenizer,
+)
 
 from lightning.pytorch.callbacks import ModelCheckpoint
 
@@ -317,18 +324,19 @@ def main():
         )
 
     # -------------------------------------------------------------------------
-    # Dataset integrity checks
+    # Dataset integrity checks - for AR
     # -------------------------------------------------------------------------
 
-    check_ar_targets(
-        train_process_tokens,
-        "TRAIN",
-    )
+    if mode == "AR":
+        check_ar_targets(
+            train_process_tokens,
+            "TRAIN",
+        )
 
-    check_ar_targets(
-        val_process_tokens,
-        "VALIDATION",
-    )
+        check_ar_targets(
+            val_process_tokens,
+            "VALIDATION",
+        )
 
     train_process_tokens = train_process_tokens.with_format("torch")
     val_process_tokens = val_process_tokens.with_format("torch")
@@ -336,6 +344,7 @@ def main():
     # -------------------------------------------------------------------------
     # DataLoaders
     # -------------------------------------------------------------------------
+
     sampler_cls = samplers.RandomFaultTolerantSampler
 
     train_loader = data_manager.getTrainloader(
@@ -358,6 +367,7 @@ def main():
     # -------------------------------------------------------------------------
     # Defining backbone and loading weights
     # -------------------------------------------------------------------------
+
     backbone = BACKBONES[mode](
         V=len(data_manager.tokenizer),
         C=config.backbone.C,
@@ -378,20 +388,33 @@ def main():
     print(f"\n{mode} parameters: {utils.utils.numberOfparameters(backbone)}")
 
     if config.checkpoint is None:
-        model = MODELS[mode](backbone,
-                            data_manager.tokenizer,
-                            T=config.backbone.T,
-                            learning_rate=config.training.learning_rate,
-                            warmup_steps=config.training.warmup_steps,
-                        ).to(device)
+        hf_model = load_fn[mode]()
+
+        trasfer_weights(
+            backbone,
+            hf_model,
+            translate_weights_dict[mode],
+            run_validation=True,
+            show_layers=False,
+        )
+
+        model = MODELS[mode](
+            backbone,
+            data_manager.tokenizer,
+            T=config.backbone.T,
+            learning_rate=config.training.learning_rate,
+            warmup_steps=config.training.warmup_steps,
+        ).to(device)
+
     else:
-        model = MODELS[mode].load_from_checkpoint(config.checkpoint,
-                                                backbone=backbone,
-                                                tokenizer=data_manager.tokenizer,
-                                                T=config.backbone.T,
-                                                learning_rate=config.training.learning_rate,
-                                                warmup_steps=config.training.warmup_steps,
-                                            ).to(device)
+        model = MODELS[mode].load_from_checkpoint(
+            config.checkpoint,
+            backbone=backbone,
+            tokenizer=data_manager.tokenizer,
+            T=config.backbone.T,
+            learning_rate=config.training.learning_rate,
+            warmup_steps=config.training.warmup_steps,
+        ).to(device)
 
     # -------------------------------------------------------------------------
     # Diffusion-specific configuration
@@ -417,17 +440,11 @@ def main():
         print(f"Loaded checkpoint from: {config.checkpoint}")
 
     print("\n\n")
-    try:
-        print(f"Model noise device {model.noise.sigma_max.device}")
-    except:
-        pass
-
-    if mode == "AR":
-        print('\nmodel testing:')
-        start_token = tokenizer(tokenizer.bos_token, return_tensors="pt",
-                                add_special_tokens=False)['input_ids']
-        gen = model.generate(start_token.to(device), 100)
-        print(model.tokenizer.decode(gen[0]))
+    if hasattr(model, "noise"):
+        print(
+            f"Model noise device: "
+            f"{model.noise.sigma_max.device}"
+        )
 
     if mode in ["BERT", "DiT"]:
         checkpoint_prefix = (
@@ -475,7 +492,6 @@ def main():
         )
 
         model.train()
-        model.backbone.train()
 
         trainer.fit(
             model=model,
@@ -544,18 +560,6 @@ def main():
         ))
 
 
-
 if __name__ == '__main__':
     main()
-    # smoltalk = load_smoltalk()
-
-    # tokenizer = AutoTokenizer.from_pretrained(
-    #     "jhu-clsp/ettin-decoder-150m",
-    # )
-    # test.test_smoltalk(smoltalk, tokenizer)
-
-    # print("Special Tokens:")
-    # for token in tokenizer.all_special_tokens:
-    #     token_encoded=tokenizer(token, add_special_tokens=False)
-    #     print(f"{token: <8} --> {token_encoded['input_ids']}")
 
