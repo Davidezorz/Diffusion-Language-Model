@@ -146,30 +146,54 @@ def count_pad(process_tokens,
 
 def main():
     """
-        Main training and evaluation pipeline.
+    Main training and evaluation pipeline.
 
-        Steps
-        -----
-        1. Load configuration
-        2. Load dataset
-        3. Tokenize and preprocess
-        4. Build dataloaders
-        5. Initialize backbone (AR, BERT or DiT)
-        6. Load pretrained weights or checkpoint
-        7. Train (optional)
-        8. Run qualitative generation examples
-        """
+    Steps
+    -----
+    1. Load configuration
+    2. Load dataset
+    3. Tokenize and preprocess
+    4. Build dataloaders
+    5. Initialize backbone (AR, BERT or DiT)
+    6. Load pretrained weights or checkpoint
+    7. Train (optional)
+    8. Run qualitative generation examples
+    """
     torch.set_float32_matmul_precision("high") # for CUDA
     print('Main online\n')
 
     # -------------------------------------------------------------------------
     # Configuration and runtime setup
     # -------------------------------------------------------------------------
-    config = OmegaConf.load("config.yaml")                                      # get the config
-    mode   = config.mode
+    config = OmegaConf.load("config.yaml")    # get the config
+    mode = config.mode
 
-    backbones = {"AR": AR,  "BERT": BERT,      "DiT": DiT}
-    models    = {"AR": GPT, "BERT": Diffusion, "DiT": Diffusion}
+    print(
+        f"""
+    ======================================================
+    Experiment
+    ======================================================
+
+    Mode               : {mode}
+    Checkpoint         : {config.checkpoint}
+
+    Context length     : {config.backbone.T}
+    Embedding dim      : {config.backbone.C}
+    Layers             : {config.backbone.N}
+    Heads              : {config.backbone.H}
+
+    Learning rate      : {config.training.learning_rate}
+    Warmup             : {config.training.warmup_steps}
+    Epochs             : {config.training.max_epochs}
+    Batch size         : {config.backbone.B}
+    Gradient accum.    : {config.training.accumulate_grad_batches}
+
+    ======================================================
+    """
+    )
+
+    BACKBONES = {"AR": AR,  "BERT": BERT,      "DiT": DiT}
+    MODELS    = {"AR": GPT, "BERT": Diffusion, "DiT": Diffusion}
 
     load_fn   = {"AR":   load_ModernBERTDecoder, 
                  "BERT": load_ModernBERT, 
@@ -214,16 +238,20 @@ def main():
         config.mode,
         n_processes,
     )
-    train_tokens = data_manager.tokenize(
-    train_dataset,
-    split_name="train",
-    )
 
-    val_tokens = data_manager.tokenize(
-        val_dataset,
-        split_name="validation",
-    )
+    tokenized = {}
 
+    for split_name, split in {
+        "train": train_dataset,
+        "validation": val_dataset,
+    }.items():
+        tokenized[split_name] = data_manager.tokenize(
+            split,
+            split_name=split_name,
+        )
+
+    train_tokens = tokenized["train"]
+    val_tokens = tokenized["validation"]
 
     if mode == "AR":
         train_process_tokens = data_manager.group_texts_ar(
@@ -330,7 +358,7 @@ def main():
     # -------------------------------------------------------------------------
     # Defining backbone and loading weights
     # -------------------------------------------------------------------------
-    backbone = backbones[mode](
+    backbone = BACKBONES[mode](
         V=len(data_manager.tokenizer),
         C=config.backbone.C,
         H=config.backbone.H,
@@ -343,47 +371,21 @@ def main():
         "DiT": translate_weights_encoder,
     }
 
-    if config.checkpoint is None:
-        hf_model = load_fn[mode]()
-
-        trasfer_weights(
-            backbone,
-            hf_model,
-            translate_weights_dict[mode],
-            run_validation=True,
-            show_layers=False,
-        )
-
-        model = models[mode](
-            backbone,
-            data_manager.tokenizer,
-            T=config.backbone.T,
-        ).to(device)
-
-    else: # load from checkpoint
-        model = models[mode].load_from_checkpoint(
-            config.checkpoint,
-            backbone=backbone,
-            tokenizer=data_manager.tokenizer,
-            T=config.backbone.T,
-        ).to(device)
-
-        print(f"Loaded checkpoint from: {config.checkpoint}")
-
-    #test.test_model(backbone, tokenizer, mode)
+    # test.test_model(backbone, tokenizer, mode)
+    
     # -------------------------------------------------------------------------
         
     print(f"\n{mode} parameters: {utils.utils.numberOfparameters(backbone)}")
 
     if config.checkpoint is None:
-        model = models[mode](backbone,
+        model = MODELS[mode](backbone,
                             data_manager.tokenizer,
                             T=config.backbone.T,
                             learning_rate=config.training.learning_rate,
                             warmup_steps=config.training.warmup_steps,
                         ).to(device)
     else:
-        model = models[mode].load_from_checkpoint(config.checkpoint,
+        model = MODELS[mode].load_from_checkpoint(config.checkpoint,
                                                 backbone=backbone,
                                                 tokenizer=data_manager.tokenizer,
                                                 T=config.backbone.T,
