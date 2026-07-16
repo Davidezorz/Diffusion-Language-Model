@@ -14,7 +14,9 @@ from transformers import AutoModelForCausalLM
 class  GPT(L.LightningModule):
 
     def __init__(self, backbone, tokenizer, T=None,
-                 gen_ppl_model_id='gpt2'):
+                gen_ppl_model_id='gpt2', learning_rate=5e-5,
+                warmup_steps=1000,):
+        
         super().__init__()
         self.weights_folder = '.weights/'
 
@@ -25,6 +27,8 @@ class  GPT(L.LightningModule):
         self.vocab_size = self.tokenizer.vocab_size
 
         self.backbone = backbone
+        self.learning_rate = learning_rate
+        self.warmup_steps=warmup_steps
         """
         # For Generative PPL (External Model)
         self.eval_tokenizer = AutoTokenizer.from_pretrained(gen_ppl_model_id)
@@ -41,14 +45,14 @@ class  GPT(L.LightningModule):
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
             self.backbone.parameters(),
-            lr    = 5e-3,
+            lr    = self.learning_rate,
             betas =(0.9, 0.999),
             eps   = 1e-8,
             weight_decay = 0)
 
         scheduler = transformers.get_constant_schedule_with_warmup(
             optimizer=optimizer,
-            num_warmup_steps=2500
+            num_warmup_steps=self.warmup_steps
         )
         """
         scheduler = torch.optim.lr_scheduler.LinearLR(
@@ -64,6 +68,11 @@ class  GPT(L.LightningModule):
             'monitor': 'val/loss',
             'name': 'trainer/lr',
         }
+
+        print(
+            f"[OPTIMIZER] lr={self.learning_rate}, "
+            f"warmup_steps={self.warmup_steps}"
+        )
         return [optimizer], [scheduler_dict]
     
 
@@ -100,11 +109,23 @@ class  GPT(L.LightningModule):
         targets[(targets < 0) & (targets != -100)] = -100
         targets[targets >= V] = -100
 
+        valid_targets = targets != -100
+
+        if not valid_targets.any():
+            raise RuntimeError(
+                "Training batch without valid targets."
+            )
+
         loss = F.cross_entropy(
             logits.reshape(-1, V),
             targets.reshape(-1),
             ignore_index=-100
         )
+
+        if not torch.isfinite(loss):
+            raise RuntimeError(
+                f"Training loss not finite: {loss.item()}"
+            )
 
         return loss  
 
@@ -128,11 +149,23 @@ class  GPT(L.LightningModule):
         targets[(targets < 0) & (targets != -100)] = -100
         targets[targets >= V] = -100
 
+        valid_targets = targets != -100
+
+        if not valid_targets.any():
+            raise RuntimeError(
+                "Validation batch without valid targets."
+            )
+
         loss = F.cross_entropy(
             logits.reshape(-1, V),
             targets.reshape(-1),
             ignore_index=-100
         )
+
+        if not torch.isfinite(loss):
+            raise RuntimeError(
+                f"Validation loss not finite: {loss.item()}"
+            )
 
         return loss
 
@@ -140,10 +173,30 @@ class  GPT(L.LightningModule):
     def validation_step(self, batch, batch_idx):
         loss = self.loss_qa(batch)
 
-        self.log('val/loss', loss, on_step=False,
-                 on_epoch=True, sync_dist=True)
-        self.log('val/ppl', torch.exp(loss), on_step=False,
-                 on_epoch=True, sync_dist=True)
+        batch_size = batch["input_ids"].shape[0]
+
+        self.log(
+            "val_loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+
+        self.log(
+            "val/ppl",
+            torch.exp(torch.clamp(loss.detach(), max=20)),
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            logger=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+
         return loss
 
 

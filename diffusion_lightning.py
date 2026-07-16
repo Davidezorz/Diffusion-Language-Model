@@ -115,7 +115,8 @@ class Diffusion(L.LightningModule):
         self.sigmoid_k = 10.0
         self.calibrated_sigmoid = False
 
-        self.lr                = 3e-4
+        self.lr                = 5e-5
+        self.warmup_steps      = 1000
         self.sampling_eps      = 1e-3
         self.time_conditioning = True
         self.neg_infinity      = -1000000.0
@@ -145,7 +146,7 @@ class Diffusion(L.LightningModule):
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
             self.backbone.parameters(),
-            lr    = 3e-4,
+            lr    = self.lr,
             betas =(0.9, 0.999),
             eps   = 1e-8,
             weight_decay = 0)
@@ -153,7 +154,7 @@ class Diffusion(L.LightningModule):
 
         scheduler = transformers.get_constant_schedule_with_warmup(
             optimizer=optimizer,
-            num_warmup_steps=2500
+            num_warmup_steps=self.warmup_steps
         )
 
         scheduler_dict = {
@@ -198,6 +199,39 @@ class Diffusion(L.LightningModule):
         )
 
         return loss
+    
+    def validation_step(self, batch, batch_idx):
+        attention_mask = batch.get("attention_mask")
+
+        losses = self._loss(
+            batch["input_ids"],
+            batch["output_ids"],
+            attention_mask,
+        )
+
+        self.valid_metrics.update(
+            losses.nlls,
+            losses.token_mask,
+        )
+
+        self.log_dict(
+            self.valid_metrics,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
+
+        self.log(
+            "val_loss",
+            losses.loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            sync_dist=True,
+        )
+
+        return losses.loss
     
 
     def _loss(self, input_ids, output_ids, attention_mask):

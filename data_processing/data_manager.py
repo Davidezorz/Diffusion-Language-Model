@@ -181,8 +181,11 @@ class DataManagerQA(DataManagerPreTrain):
 
         return {"conversations": conversations}
 
-    def tokenize(self, dataset):
-        cache_file = os.path.join(self.caching_directory + 'tokenized/', "qa_tokens.arrow")
+    def tokenize(self, dataset, split_name="train"):
+        cache_file = os.path.join(
+        self.caching_directory + "tokenized/",
+        f"qa_tokens_{split_name}.arrow",
+        )
         os.makedirs(os.path.dirname(cache_file), exist_ok=True)
 
         return dataset.map(
@@ -220,6 +223,11 @@ class DataManagerQA(DataManagerPreTrain):
                 chunk_in  = [self.BOS] + chunk_in[:-1]                          # Chunk to start with [BOS]
                 chunk_lbl = [IGNORE]   + chunk_lbl[:-1]                         # Mask out the [BOS] target
                     
+                # Skip chunks with no valid target tokens
+                if all(token == IGNORE for token in chunk_lbl):
+                    i += T
+                    continue
+                
                 pad_len_in  = T - len(chunk_in)
                 pad_len_lbl = T - len(chunk_lbl)
                 
@@ -237,9 +245,12 @@ class DataManagerQA(DataManagerPreTrain):
                 'output_ids': out_blocks, 
                 'attention_mask': mask_blocks}
 
-    def group_texts_ar(self, dataset, T):
+    def group_texts_ar(self, dataset, T, split_name="train"):
         group_fn = functools.partial(self._group_ar, T=T)
-        cache_file = os.path.join(self.caching_directory + 'grouped/', f"qa_ar_T{T}.arrow")
+        cache_file = os.path.join(
+            self.caching_directory + "grouped/",
+            f"qa_ar_{split_name}_T{T}.arrow",
+            )
         os.makedirs(os.path.dirname(cache_file), exist_ok=True)
 
         return dataset.map(group_fn, 
@@ -310,9 +321,12 @@ class DataManagerQA(DataManagerPreTrain):
         }
 
 
-    def group_texts_dit(self, dataset, T_ctx, T_ans):
+    def group_texts_dit(self, dataset, T_ctx, T_ans, split_name="train"):
         group_fn = functools.partial(self._group_dit, T_ctx=T_ctx, T_ans=T_ans)
-        cache_file = os.path.join(self.caching_directory + 'grouped/', f"qa_dit_C{T_ctx}_A{T_ans}.arrow")
+        cache_file = os.path.join(
+            self.caching_directory + "grouped/",
+            f"qa_dit_{split_name}_C{T_ctx}_A{T_ans}.arrow",
+        )
         os.makedirs(os.path.dirname(cache_file), exist_ok=True)
 
         return dataset.map(group_fn, 

@@ -32,6 +32,7 @@ from models.base_model import *
 from utils.transfer_weights import *
 import test
 from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import EarlyStopping
 
 
 def load_ModernBERT():
@@ -75,6 +76,45 @@ def load_smoltalk():
 
     return ds
 
+
+def check_ar_targets(dataset, split_name):
+    empty_chunks = 0
+    total_valid_targets = 0
+    min_valid_targets = None
+    max_valid_targets = 0
+
+    for example in dataset:
+        targets = example["output_ids"]
+
+        valid_targets = sum(
+            token != -100
+            for token in targets
+        )
+
+        total_valid_targets += valid_targets
+
+        if valid_targets == 0:
+            empty_chunks += 1
+
+        if min_valid_targets is None:
+            min_valid_targets = valid_targets
+        else:
+            min_valid_targets = min(
+                min_valid_targets,
+                valid_targets,
+            )
+
+        max_valid_targets = max(
+            max_valid_targets,
+            valid_targets,
+        )
+
+    print(f"\n[{split_name} TARGET CHECK]")
+    print("Chunks:", len(dataset))
+    print("Empty chunks:", empty_chunks)
+    print("Minimum valid targets:", min_valid_targets)
+    print("Maximum valid targets:", max_valid_targets)
+    print("Total valid targets:", total_valid_targets)
 
 
 
@@ -153,68 +193,194 @@ def main():
 
     dataset = load_smoltalk()
 
-    data_manager = DataManagerQA(caching_directory, tokenizer,
-                                 config.mode, n_processes)
-    tokens = data_manager.tokenize(dataset)
+    print("\n[DATASET SIZE]")
+    print("Original conversations:", len(dataset))
+
+    dataset_split = dataset.train_test_split(
+        test_size=config.training.validation_fraction,
+        seed=config.training.seed,
+        shuffle=True,
+    )
+
+    train_dataset = dataset_split["train"]
+    val_dataset = dataset_split["test"]
+
+    print("Training conversations:", len(train_dataset))
+    print("Validation conversations:", len(val_dataset))
+
+    data_manager = DataManagerQA(
+        caching_directory,
+        tokenizer,
+        config.mode,
+        n_processes,
+    )
+    train_tokens = data_manager.tokenize(
+    train_dataset,
+    split_name="train",
+    )
+
+    val_tokens = data_manager.tokenize(
+        val_dataset,
+        split_name="validation",
+    )
+
+
     if mode == "AR":
-        process_tokens = data_manager.group_texts(tokens, config.backbone.T)
-    else:
-        process_tokens = data_manager.group_texts(
-            tokens,
-            config.backbone.T_ctx,
-            config.backbone.T_ans
+        train_process_tokens = data_manager.group_texts_ar(
+            train_tokens,
+            config.backbone.T,
+            split_name="train",
         )
 
-    debug_subset_size = config.training.get("debug_subset_size", None)
+        val_process_tokens = data_manager.group_texts_ar(
+            val_tokens,
+            config.backbone.T,
+            split_name="validation",
+        )
+
+    else:
+        train_process_tokens = data_manager.group_texts_dit(
+            train_tokens,
+            config.backbone.T_ctx,
+            config.backbone.T_ans,
+            split_name="train",
+        )
+
+        val_process_tokens = data_manager.group_texts_dit(
+            val_tokens,
+            config.backbone.T_ctx,
+            config.backbone.T_ans,
+            split_name="validation",
+        )
+
+
+
+    debug_subset_size = config.training.get(
+        "debug_subset_size",
+        None,
+    )
 
     if debug_subset_size is not None:
-        process_tokens = process_tokens.select(range(debug_subset_size))                      # uncomment here if you want a chunked dataset
-        process_tokens = process_tokens.with_format('torch')
+        train_subset_size = min(
+            debug_subset_size,
+            len(train_process_tokens),
+        )
 
-    print_token_examples(process_tokens, tokenizer)
-    
+        train_process_tokens = train_process_tokens.select(
+            range(train_subset_size)
+        )
+
+    validation_subset_size = config.training.get(
+        "validation_subset_size",
+        None,
+    )
+
+    if validation_subset_size is not None:
+        validation_subset_size = min(
+            validation_subset_size,
+            len(val_process_tokens),
+        )
+
+        val_process_tokens = val_process_tokens.select(
+            range(validation_subset_size)
+        )  
+
+    check_ar_targets(
+        train_process_tokens,
+        "TRAIN",
+    )
+
+    check_ar_targets(
+        val_process_tokens,
+        "VALIDATION",
+    )
+
+    train_process_tokens = train_process_tokens.with_format("torch")
+    val_process_tokens = val_process_tokens.with_format("torch")
     # -------------------------------------------------------------------------
     
     sampler_cls = samplers.RandomFaultTolerantSampler
-    train_loader = data_manager.getTrainloader(process_tokens, config.backbone.B,
-                                               sampler_cls)
 
+    train_loader = data_manager.getTrainloader(
+        train_process_tokens,
+        config.backbone.B,
+        sampler_cls,
+    )
+
+    val_loader = torch.utils.data.DataLoader(
+        val_process_tokens,
+        batch_size=config.backbone.B,
+        num_workers=n_processes,
+        pin_memory=True,
+        shuffle=False,
+        persistent_workers=n_processes > 0,
+    )
 
     test.test_train_loader(train_loader)
-    count_pad(process_tokens, tokenizer)
 
     # -------------------------------------------------------------------------
     # defining backbone and loading weights
     # -------------------------------------------------------------------------
-    backbone = backbones[mode](V = len(data_manager.tokenizer),                 # ◀ vocabulary size
-                               C = config.backbone.C,                           # ◀ embedding dimension
-                               H = config.backbone.H,                           # ◀ number of heads
-                               N = config.backbone.N,                           # ◀ number of blocks
-                              )
-    translate_weights_dict = {"AR":   translate_weights_decoder,
-                              "BERT": translate_weights_encoder, 
-                              "DiT":  translate_weights_encoder}
+    backbone = backbones[mode](
+        V=len(data_manager.tokenizer),
+        C=config.backbone.C,
+        H=config.backbone.H,
+        N=config.backbone.N,
+    )
 
-    hf_model = load_fn[mode]()                                                  # hugghingface model
-
-    trasfer_weights(backbone, hf_model, translate_weights_dict[mode], 
-                    run_validation=True, show_layers=False)
-
-    test.test_model(backbone, tokenizer, mode)
-    # -------------------------------------------------------------------------
-        
-    print(f"\n{mode} parameters: {utils.utils.numberOfparameters(backbone)}")
+    translate_weights_dict = {
+        "AR": translate_weights_decoder,
+        "BERT": translate_weights_encoder,
+        "DiT": translate_weights_encoder,
+    }
 
     if config.checkpoint is None:
-        model = models[mode](backbone, data_manager.tokenizer,
-                            T=config.backbone.T).to(device)
-    else:
+        hf_model = load_fn[mode]()
+
+        trasfer_weights(
+            backbone,
+            hf_model,
+            translate_weights_dict[mode],
+            run_validation=True,
+            show_layers=False,
+        )
+
+        model = models[mode](
+            backbone,
+            data_manager.tokenizer,
+            T=config.backbone.T,
+        ).to(device)
+
+    else: # load from checkpoint
         model = models[mode].load_from_checkpoint(
             config.checkpoint,
             backbone=backbone,
             tokenizer=data_manager.tokenizer,
             T=config.backbone.T,
         ).to(device)
+
+        print(f"Loaded checkpoint from: {config.checkpoint}")
+
+    #test.test_model(backbone, tokenizer, mode)
+    # -------------------------------------------------------------------------
+        
+    print(f"\n{mode} parameters: {utils.utils.numberOfparameters(backbone)}")
+
+    if config.checkpoint is None:
+        model = models[mode](backbone,
+                            data_manager.tokenizer,
+                            T=config.backbone.T,
+                            learning_rate=config.training.learning_rate,
+                            warmup_steps=config.training.warmup_steps,
+                        ).to(device)
+    else:
+        model = models[mode].load_from_checkpoint(config.checkpoint,
+                                                backbone=backbone,
+                                                tokenizer=data_manager.tokenizer,
+                                                T=config.backbone.T,
+                                                learning_rate=config.training.learning_rate,
+                                                warmup_steps=config.training.warmup_steps,
+                                            ).to(device)
 
     if mode in ["BERT", "DiT"]:
         noise_name = config.diffusion.get("noise_schedule", "loglinear")
@@ -246,35 +412,56 @@ def main():
 
     """
     """
+    if mode in ["BERT", "DiT"]:
+        checkpoint_prefix = (
+            f"{mode}-{config.diffusion.corruption_type}"
+        )
+    else:
+        checkpoint_prefix = mode
+
     checkpoint_callback = ModelCheckpoint(
         dirpath="checkpoints",
-        filename=f"{mode}-{config.diffusion.corruption_type}" + "-{epoch:02d}-{trainer/loss:.4f}",
-        monitor="trainer/loss",
+        filename=(
+            checkpoint_prefix
+            + "-{epoch:02d}-{val_loss:.4f}"
+        ),
+        monitor="val_loss",
         save_top_k=2,
         mode="min",
         save_last=True,
     )
 
-    print("\ntraining:")
-    trainer = L.Trainer(
-        max_epochs=config.training.max_epochs,
-        accelerator=device,
-        devices=1,
-        enable_progress_bar=True,
-        limit_train_batches=config.training.limit_train_batches,
-        log_every_n_steps=config.training.log_every_n_steps,
-        callbacks=[checkpoint_callback],
-    )
+    # allow training only if set in the config
+    inference_only = config.get("inference_only", False)
 
+    if not inference_only:
+        print("\ntraining:")
 
-    model.train()
-    model.backbone.train()
+        trainer = L.Trainer(
+            max_epochs=config.training.max_epochs,
+            accelerator=device,
+            devices=1,
+            enable_progress_bar=True,
+            limit_train_batches=config.training.limit_train_batches,
+            log_every_n_steps=config.training.log_every_n_steps,
+            accumulate_grad_batches=config.training.accumulate_grad_batches,
+            callbacks=[checkpoint_callback],
+            limit_val_batches=config.training.get(
+                "limit_val_batches",
+                1.0,
+            ),
+            gradient_clip_val=1.0,
+            gradient_clip_algorithm="norm",
+        )
 
-    trainer.fit(
-        model=model, 
-        train_dataloaders=train_loader,
-        # val_dataloaders=train_loader
-    )
+        model.train()
+        model.backbone.train()
+
+        trainer.fit(
+            model=model,
+            train_dataloaders=train_loader,
+            val_dataloaders=val_loader,
+        )
 
 
     model.to(device)
@@ -285,21 +472,71 @@ def main():
 
 
     # text1 = "User: What is the capital of France?"
-    text1 = "User: Can a dog fly?"
-    text2 = "Assistant: "
+    # text1 = "User: Can a dog fly?"
+    # text2 = "Assistant: "
 
-    tokenizer_kwargs = {'return_tensors': "pt", 'add_special_tokens': False}
-    input1 = tokenizer(text1, **tokenizer_kwargs)['input_ids']
-    input2 = tokenizer(text2, **tokenizer_kwargs)['input_ids']
+    # tokenizer_kwargs = {'return_tensors': "pt", 'add_special_tokens': False}
+    # input1 = tokenizer(text1, **tokenizer_kwargs)['input_ids']
+    # input2 = tokenizer(text2, **tokenizer_kwargs)['input_ids']
 
-    BOS = torch.tensor([[tokenizer.bos_token_id]]).expand(1, -1)
-    EOS = torch.tensor([[tokenizer.eos_token_id]]).expand(1, -1)
+    # BOS = torch.tensor([[tokenizer.bos_token_id]]).expand(1, -1)
+    # EOS = torch.tensor([[tokenizer.eos_token_id]]).expand(1, -1)
 
-    inputs = torch.cat([BOS, input1, EOS, input2], dim=-1)
-    gen = model.generate(inputs.to(device), 50, temperature=0.5)
-    print(model.tokenizer.decode(gen[0]))
+    # inputs = torch.cat([BOS, input1, EOS, input2], dim=-1)
+    # gen = model.generate(inputs.to(device), 50, temperature=0.5)
+    # print(model.tokenizer.decode(gen[0]))
 
+    test_prompts = [
+        "Can a dog fly?",
+        "What is the capital of France?",
+        "Explain gravity to a ten-year-old.",
+        "Write a Python function that computes the Fibonacci sequence.",
+        "Why is the sky blue?",
+        "What should someone consider before changing jobs?",
+        ]
 
+    for question in test_prompts:
+        text1 = f"User: {question}"
+        text2 = "Assistant: "
+
+        input1 = tokenizer(
+            text1,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )["input_ids"]
+
+        input2 = tokenizer(
+            text2,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )["input_ids"]
+
+        bos = torch.tensor([[tokenizer.bos_token_id]])
+        eos = torch.tensor([[tokenizer.eos_token_id]])
+
+        inputs = torch.cat([bos, input1, eos, input2], dim=-1).to(device)
+
+        if mode == "AR":
+            generated = model.generate(
+                inputs,
+                n_tokens=256,
+                temperature=0.6,
+            )
+
+        else:  # DiT 
+            generated = model.generate(
+                inputs,
+                n_tokens=256,
+                num_steps=100,
+                temperature=0.8,
+            )
+
+        print("\nQUESTION:", question)
+        print("\n")
+        print(tokenizer.decode(
+            generated[0],
+            skip_special_tokens=True,
+        ))
 
 
 
