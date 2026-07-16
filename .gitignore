@@ -6,6 +6,9 @@ checkpoints/
 # markdown
 project.md
 
+# necessities for training
+test_checkpoints.py
+plots.ipynb
 
 # data
 .data/
