@@ -69,8 +69,19 @@ def load_smoltalk():
                                split="train[:10%]",                             # TODO: change it back to 'train'
                                cache_dir=".data"
                               )
-    # print(ds.cache_files)
+    print(ds.cache_files)
+    print(len(ds))
+    return ds
 
+
+def load_smoltal_test():
+    ds = datasets.load_dataset("HuggingFaceTB/smoltalk",
+                               "all",
+                               split="test[:10%]",                             # TODO: change it back to 'train'
+                               cache_dir=".data"
+                              )
+    print(ds.cache_files)
+    print(len(ds))
     return ds
 
 
@@ -117,6 +128,9 @@ def count_pad(process_tokens, tokenizer):
 
 def main():
     print('main online\n')
+    load_smoltalk()
+    load_smoltal_test()
+    return
     config = OmegaConf.load("config.yaml")                                      # get the config
     mode   = config.mode
 
