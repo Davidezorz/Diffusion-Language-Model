@@ -1,38 +1,25 @@
-import numpy as np
-import torch
 import lightning as L
-
-import matplotlib.pyplot as plt
 import datasets
 from omegaconf import OmegaConf
 
-import models.masking_schedule as masking_schedule
 import models.noise_schedule as noise_schedule
-from data_processing.data_manager import DataManagerPreTrain, DataManagerQA
+from data_processing.data_manager import DataManagerQA
 import utils.utils
-
 from models.AR import AR
 from models.BERT import BERT
 from GPT_Lightning import GPT
-
 from models.DiT import DiT
 from diffusion_lightning import Diffusion
 import data_processing.samplers as samplers
-
-from transformers import AutoModelForCausalLM, AutoModelForMaskedLM, AutoTokenizer
-
-
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from einops import rearrange, repeat 
-from models.base_model import *
-
 from utils.transfer_weights import *
 import test
+
 from lightning.pytorch.callbacks import ModelCheckpoint
-from lightning.pytorch.callbacks import EarlyStopping
+
+
+# ╭───────────────────────────────────────────────────────────────────────────╮
+# │                          Model Loading                                    │
+# ╰───────────────────────────────────────────────────────────────────────────╯
 
 
 def load_ModernBERT():
@@ -42,8 +29,6 @@ def load_ModernBERT():
         )
     return hf_model
 
-
-
 def load_ModernBERTDecoder():
     print("Downloading load_ModernBERTDecoder weights...")
     hf_model = AutoModelForCausalLM.from_pretrained(
@@ -52,8 +37,12 @@ def load_ModernBERTDecoder():
     return hf_model
 
 
+# ╭───────────────────────────────────────────────────────────────────────────╮
+# │                        Dataset Loading                                    │
+# ╰───────────────────────────────────────────────────────────────────────────╯
 
-def load_shakespeare(caching_directory, print_first_lines=False):
+def load_shakespeare(caching_directory,
+                     print_first_lines=False):
     dataset = datasets.load_dataset("Trelis/tiny-shakespeare",
                                     cache_dir=caching_directory)
     dataset = dataset.rename_column("Text", "text")
@@ -63,8 +52,6 @@ def load_shakespeare(caching_directory, print_first_lines=False):
         print(repr(dataset['train'][0]['text'][:150]))
 
     return dataset
-
-
 
 def load_smoltalk():
     ds = datasets.load_dataset("HuggingFaceTB/smoltalk",
@@ -76,8 +63,12 @@ def load_smoltalk():
 
     return ds
 
+# ╭───────────────────────────────────────────────────────────────────────────╮
+# │                    Dataset diagnostics                                    │
+# ╰───────────────────────────────────────────────────────────────────────────╯
 
-def check_ar_targets(dataset, split_name):
+def check_ar_targets(dataset,
+                     split_name):
     empty_chunks = 0
     total_valid_targets = 0
     min_valid_targets = None
@@ -116,8 +107,6 @@ def check_ar_targets(dataset, split_name):
     print("Maximum valid targets:", max_valid_targets)
     print("Total valid targets:", total_valid_targets)
 
-
-
 def print_token_examples(process_tokens, tokenizer,
                          keys = ['input_ids']):
     print('\nexample of the tokenized dataset (encoded and decoded): \n')
@@ -134,7 +123,8 @@ def print_token_examples(process_tokens, tokenizer,
 
 
 
-def count_pad(process_tokens, tokenizer):
+def count_pad(process_tokens,
+              tokenizer):
     n_pad, tot = 0, 0
     pad_str = tokenizer.pad_token
     pad = torch.tensor(tokenizer.encode(pad_str, add_special_tokens=False))
@@ -150,17 +140,31 @@ def count_pad(process_tokens, tokenizer):
     print(f"p:     {n_pad/tot*100: .2f}% \n")
 
 
-
-
-
 # ╭───────────────────────────────────────────────────────────────────────────╮
 # │                                   Main                                    │
 # ╰───────────────────────────────────────────────────────────────────────────╯
 
 def main():
-    torch.set_float32_matmul_precision("high") # for CUDA
+    """
+        Main training and evaluation pipeline.
 
-    print('main online\n')
+        Steps
+        -----
+        1. Load configuration
+        2. Load dataset
+        3. Tokenize and preprocess
+        4. Build dataloaders
+        5. Initialize backbone (AR, BERT or DiT)
+        6. Load pretrained weights or checkpoint
+        7. Train (optional)
+        8. Run qualitative generation examples
+        """
+    torch.set_float32_matmul_precision("high") # for CUDA
+    print('Main online\n')
+
+    # -------------------------------------------------------------------------
+    # Configuration and runtime setup
+    # -------------------------------------------------------------------------
     config = OmegaConf.load("config.yaml")                                      # get the config
     mode   = config.mode
 
@@ -180,16 +184,8 @@ def main():
     )
 
     # -------------------------------------------------------------------------
-    """
-    dataset = load_shakespeare(caching_directory)
-
-    data_manager = DataManagerPreTrain(caching_directory, tokenizer, n_processes)
-    tokens = data_manager.tokenize(dataset['train'])
-    process_tokens = data_manager.group_texts(tokens, config.backbone.T)
-    process_tokens = process_tokens.with_format('torch')
-
-    print_token_examples(process_tokens, tokenizer)
-    """
+    # Dataset loading and train/validation split
+    # -------------------------------------------------------------------------
 
     dataset = load_smoltalk()
 
@@ -207,6 +203,10 @@ def main():
 
     print("Training conversations:", len(train_dataset))
     print("Validation conversations:", len(val_dataset))
+
+    # -------------------------------------------------------------------------
+    # Tokenization and sequence grouping
+    # -------------------------------------------------------------------------
 
     data_manager = DataManagerQA(
         caching_directory,
@@ -254,6 +254,9 @@ def main():
         )
 
 
+    # -------------------------------------------------------------------------
+    # Optional dataset subsets for debugging
+    # -------------------------------------------------------------------------
 
     debug_subset_size = config.training.get(
         "debug_subset_size",
@@ -283,7 +286,11 @@ def main():
 
         val_process_tokens = val_process_tokens.select(
             range(validation_subset_size)
-        )  
+        )
+
+    # -------------------------------------------------------------------------
+    # Dataset integrity checks
+    # -------------------------------------------------------------------------
 
     check_ar_targets(
         train_process_tokens,
@@ -297,8 +304,10 @@ def main():
 
     train_process_tokens = train_process_tokens.with_format("torch")
     val_process_tokens = val_process_tokens.with_format("torch")
+
     # -------------------------------------------------------------------------
-    
+    # DataLoaders
+    # -------------------------------------------------------------------------
     sampler_cls = samplers.RandomFaultTolerantSampler
 
     train_loader = data_manager.getTrainloader(
@@ -319,7 +328,7 @@ def main():
     test.test_train_loader(train_loader)
 
     # -------------------------------------------------------------------------
-    # defining backbone and loading weights
+    # Defining backbone and loading weights
     # -------------------------------------------------------------------------
     backbone = backbones[mode](
         V=len(data_manager.tokenizer),
@@ -382,6 +391,10 @@ def main():
                                                 warmup_steps=config.training.warmup_steps,
                                             ).to(device)
 
+    # -------------------------------------------------------------------------
+    # Diffusion-specific configuration
+    # -------------------------------------------------------------------------
+
     if mode in ["BERT", "DiT"]:
         noise_name = config.diffusion.get("noise_schedule", "loglinear")
         if noise_name == "loglinear":
@@ -393,6 +406,10 @@ def main():
         model.position_loss_weighting = config.diffusion.get("position_loss_weighting", False)
         model.sigmoid_k = config.diffusion.get("sigmoid_k", 10.0)
         model.calibrated_sigmoid = config.diffusion.get("calibrated_sigmoid", False)
+
+    # -------------------------------------------------------------------------
+    # Checkpoint configuration
+    # -------------------------------------------------------------------------
 
     if config.checkpoint is not None:
         print(f"Loaded checkpoint from: {config.checkpoint}")
@@ -410,8 +427,6 @@ def main():
         gen = model.generate(start_token.to(device), 100)
         print(model.tokenizer.decode(gen[0]))
 
-    """
-    """
     if mode in ["BERT", "DiT"]:
         checkpoint_prefix = (
             f"{mode}-{config.diffusion.corruption_type}"
@@ -431,6 +446,9 @@ def main():
         save_last=True,
     )
 
+    # -------------------------------------------------------------------------
+    # Training
+    # -------------------------------------------------------------------------
     # allow training only if set in the config
     inference_only = config.get("inference_only", False)
 
@@ -463,28 +481,13 @@ def main():
             val_dataloaders=val_loader,
         )
 
+    # -------------------------------------------------------------------------
+    # Qualitative generation test
+    # -------------------------------------------------------------------------
 
     model.to(device)
     model.eval()
-    print('\nmodel testing:')
-    #gen = model.generate(start_token.to(device), 200)
-    # print(model.tokenizer.decode(gen[0]))
-
-
-    # text1 = "User: What is the capital of France?"
-    # text1 = "User: Can a dog fly?"
-    # text2 = "Assistant: "
-
-    # tokenizer_kwargs = {'return_tensors': "pt", 'add_special_tokens': False}
-    # input1 = tokenizer(text1, **tokenizer_kwargs)['input_ids']
-    # input2 = tokenizer(text2, **tokenizer_kwargs)['input_ids']
-
-    # BOS = torch.tensor([[tokenizer.bos_token_id]]).expand(1, -1)
-    # EOS = torch.tensor([[tokenizer.eos_token_id]]).expand(1, -1)
-
-    # inputs = torch.cat([BOS, input1, EOS, input2], dim=-1)
-    # gen = model.generate(inputs.to(device), 50, temperature=0.5)
-    # print(model.tokenizer.decode(gen[0]))
+    print('\nModel testing:')
 
     test_prompts = [
         "Can a dog fly?",
