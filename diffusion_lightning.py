@@ -44,19 +44,13 @@ class Loss:
     nlls: torch.FloatTensor
     token_mask: torch.FloatTensor
 
-
-
 class NLL(torchmetrics.aggregation.MeanMetric):
     pass
-    
-
 
 class BPD(NLL):
     def compute(self) -> torch.Tensor:
         """Computes the bits per dimension."""
         return self.mean_value / self.weight / LOG2
-
-
 
 class Perplexity(NLL):
     def compute(self) -> torch.Tensor:
@@ -480,8 +474,8 @@ class Diffusion(L.LightningModule):
 
         for i in range(num_steps):
             t = timesteps[i] * torch.ones(B, 1, device=device)
-            x_new = self._ddpm_update_conditional(
-                x=x,
+            x_s = self._ddpm_update_conditional(
+                x_t=x,
                 t=t,
                 dt=dt,
                 gen_mask=gen_mask,
@@ -489,7 +483,13 @@ class Diffusion(L.LightningModule):
             )
 
             # we keep prompt frozen
-            x = torch.where(gen_mask, x_new, x)
+            x = self._ddpm_update_conditional(
+                x_t=x,
+                t=t,
+                dt=dt,
+                gen_mask=gen_mask,
+                temperature=temperature,
+            )
 
         # final denoise step only on answer positions
         t = timesteps[-1] * torch.ones(B, 1, device=device)
@@ -511,59 +511,88 @@ class Diffusion(L.LightningModule):
         x = torch.where(gen_mask, final_tokens, x)
 
         return x
-    
 
     def _ddpm_update_conditional(
-        self,
-        x,
-        t,
-        dt,
-        gen_mask,
-        temperature=1.0,
+            self,
+            x_t,
+            t,
+            dt,
+            gen_mask,
+            temperature=1.0,
     ):
         """
-        Performs a single reverse diffusion step for conditional generation.
+        Sample one conditional reverse-diffusion transition from time t to s,
+        where s = t - dt. For every currently masked position, the reverse distribution is
 
-        Given the current partially denoised sequence, the model predicts the
-        distribution over the original clean tokens and computes the DDPM update.
-        Only the answer region is modified; the prompt tokens remain fixed.
+        p_theta(x_s | x_t)
+            = ((mu_t - mu_s) / mu_t) p_theta(x_0 | x_t)
+              + (mu_s / mu_t) delta_MASK,
 
-        Since no padding is present during generation, the sequence length passed
-        to the backbone corresponds to the full generated sequence.
+        where
+            mu_t = 1 - exp(-sigma_t)
+            mu_s = 1 - exp(-sigma_s)
+
+        Since 1 / mu_t is a common positive normalization factor, the sampler
+        uses the equivalent unnormalized categorical weights
+
+            w(x_s)
+                = (mu_t - mu_s) p_theta(x_0 | x_t)
+                  + mu_s delta_MASK.
+
+        Tokens already revealed remain unchanged according to the SUBS assumptions, positions outside gen_mask are conditioning
+        tokens are therefore kept fixed.
 
         Args:
-            x: current sequence of prompt and generated tokens
-            t: current diffusion time
-            dt: time step size
-            gen_mask: boolean mask indicating which positions belong to the
-                generated answer
-            temperature: sampling temperature applied to the model logits
+            x_t: current sequence at diffusion time t, with shape (B, T).
+            t: current diffusion time, with shape (B, 1).
+            dt: Reverse time-step size. The next time is s = t - dt.
+            gen_mask: Boolean tensor identifying positions allowed to evolve.
+                In conditional QA generation, these are the answer positions.
+            temperature: temperature applied to the predicted clean-token distribution.
 
         Returns:
-            updated sequence after one reverse diffusion step
+            x_s:
+                Sequence sampled at the earlier diffusion time s.
         """
+        B = x_t.shape[0]
+        device = x_t.device
 
-        B = x.shape[0]
-        device = x.device
+        # ------------------------------------------------------------------
+        # 1. Define the two diffusion times: current t and earlier s < t
+        # ------------------------------------------------------------------
+        s = t - dt
 
         sigma_t, _ = self.noise(t)
-        sigma_s, _ = self.noise(t - dt)
-
+        sigma_s, _ = self.noise(s)
         sigma_t = sigma_t.squeeze(-1)
         sigma_s = sigma_s.squeeze(-1)
 
-        move_chance_t = 1 - torch.exp(-sigma_t)[:, None, None]
-        move_chance_s = 1 - torch.exp(-sigma_s)[:, None, None]
+        # ------------------------------------------------------------------
+        # 2. Forward masking probabilities
+        #    mu_t = P(x_t = MASK | x_0)
+        #    mu_s = P(x_s = MASK | x_0)
+        # ------------------------------------------------------------------
+
+        mu_t = 1 - torch.exp(-sigma_t)
+        mu_s = 1 - torch.exp(-sigma_s)
+
+        # Reshape for broadcasting over sequence positions and vocabulary
+        mu_t = mu_t[:, None, None]
+        mu_s = mu_s[:, None, None]
+
+        # ------------------------------------------------------------------
+        # 3. Predict the clean-token distribution -> log_p_x0 = log p_theta(x_0 | x_t, t)
+        # ------------------------------------------------------------------
 
         seqlens = torch.full(
             (B,),
-            x.shape[1],
+            x_t.shape[1],
             dtype=torch.long,
             device=device,
         )
 
         log_p_x0 = self.forward(
-            x,
+            x_t,
             sigma_t,
             seqlens=seqlens,
         )
@@ -571,18 +600,57 @@ class Diffusion(L.LightningModule):
         if temperature != 1.0:
             log_p_x0 = log_p_x0 / temperature
 
-        q_xs = log_p_x0.exp() * (move_chance_t - move_chance_s)
-        q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
+        p_x0 = log_p_x0.exp()
 
-        x_sample = _sample_categorical(q_xs, q_xs.device)
+        # ------------------------------------------------------------------
+        # 4. Construct the reverse categorical distribution
+        # ------------------------------------------------------------------
 
-        not_masked = (x != self.mask_index).to(x.dtype)
-        x_updated = not_masked * x + (1 - not_masked) * x_sample
+        reveal_mass = mu_t - mu_s
+        remain_masked_mass = mu_s
 
-        x_updated = torch.where(gen_mask, x_updated, x)
+        reverse_weights = p_x0 * reveal_mass
 
-        return x_updated
+        reverse_weights[:, :, self.mask_index] = (
+            remain_masked_mass[:, :, 0]
+        )
 
+        # ------------------------------------------------------------------
+        # 5. Sample x_s from the reverse categorical weights
+        # ------------------------------------------------------------------
+
+        sampled_x_s = _sample_categorical(
+            reverse_weights,
+            reverse_weights.device,
+        )
+
+        # ------------------------------------------------------------------
+        # 6. Enforce the SUBS assumptions:
+        #    - if x_t is already visible, then x_s = x_t.
+        #    - only currently masked positions may change.
+        # ------------------------------------------------------------------
+
+        currently_masked = x_t == self.mask_index
+
+        x_s = torch.where(
+            currently_masked,
+            sampled_x_s,
+            x_t,
+        )
+
+        # ------------------------------------------------------------------
+        # 7. Enforce conditional generation:
+        #    - context positions remain fixed
+        #    - only answer positions identified by gen_mask may evolve
+        # ------------------------------------------------------------------
+
+        x_s = torch.where(
+            gen_mask,
+            x_s,
+            x_t,
+        )
+
+        return x_s
 
 
 def _sample_categorical(categorical_probs, device):
