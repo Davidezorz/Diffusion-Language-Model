@@ -128,8 +128,9 @@ def count_pad(process_tokens, tokenizer):
 
 def main():
     print('main online\n')
-    load_smoltalk()
-    load_smoltal_test()
+    #load_smoltalk()
+    #load_smoltal_test()
+    test.test_masking_schedule()
     return
     config = OmegaConf.load("config.yaml")                                      # get the config
     mode   = config.mode

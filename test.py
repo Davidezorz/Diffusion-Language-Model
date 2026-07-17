@@ -117,3 +117,28 @@ def test_model(model, tokenizer, mode):
         output = model.generate(inputs, mask_id=tokenizer.mask_token_id)
     print(tokenizer.decode(output))
 
+
+
+from masking_schedule import Masking
+from noise_schedule import LogLinearNoise
+from utils.utils import getDevice
+
+def test_masking_schedule():
+    device = getDevice()
+    noise = LogLinearNoise()
+    B, T = 2, 10
+    masking = Masking(T=T, noise=noise, k=10, gamma=0.2)
+
+    t = torch.zeros(B, device=device) + 0.001
+    vanilla, vanilla_w  = masking.vanilla_masking(t, True)
+    print(f"vanilla:      \n{vanilla}")
+    print(f"vanilla_w:    \n{vanilla_w}\n\n")
+
+    positional, positional_w = masking.position_dependent_masking(t, True)
+    print(f"positional:   \n{positional}")
+    print(f"positional_w: \n{positional_w}\n\n")
+    
+    sigmoid, sigmoid_w = masking.moving_sigmoid_masking(t, True)
+    print(f"sigmoid:      \n{sigmoid}")
+    print(f"sigmoid_w:    \n{sigmoid_w}\n\n")
+    

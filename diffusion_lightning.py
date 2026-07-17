@@ -68,7 +68,7 @@ class Perplexity(NLL):
 # │                                  Diffusion                                   │
 # ╰──────────────────────────────────────────────────────────────────────────────╯
 # ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-
+ 
 class Diffusion(L.LightningModule):
     def __init__(self,
                  backbone,
@@ -324,3 +324,5 @@ def _sample_categorical(categorical_probs, device):
   gumbel_norm = ( 1e-10 - (torch.rand_like(categorical_probs, device=device) 
                            + 1e-10).log())
   return (categorical_probs / gumbel_norm).argmax(dim=-1)
+
+
