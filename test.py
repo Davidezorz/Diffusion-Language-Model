@@ -129,7 +129,7 @@ def test_masking_schedule():
     B, T = 2, 10
     masking = Masking(T=T, noise=noise, k=10, gamma=0.2)
 
-    t = torch.zeros(B, device=device) + 0.001
+    t = torch.zeros(B, device=device) + 0.5
     vanilla, vanilla_w  = masking.vanilla_masking(t, True)
     print(f"vanilla:      \n{vanilla}")
     print(f"vanilla_w:    \n{vanilla_w}\n\n")

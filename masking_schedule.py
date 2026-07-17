@@ -12,7 +12,7 @@ class Masking:
         self.k     = k                                                      # strength of the sigmoid method
 
 
-    def get_loss_weight(self, dsigma, sigma):
+    def _get_loss_weight(self, dsigma, sigma):
         return (dsigma / torch.expm1(sigma))[:, None]                       # dsigma / {e^{sigma}-1}
     
 
@@ -20,7 +20,7 @@ class Masking:
         sigma, dsigma = self.noise(t)
 
         move_chance = 1 - torch.exp(-sigma[:, None])
-        loss_weight = self.get_loss_weight(dsigma, sigma)
+        loss_weight = self._get_loss_weight(dsigma, sigma)
 
         return move_chance, loss_weight
     
@@ -50,7 +50,7 @@ class Masking:
                 * alpha / (1 - alpha).clamp_min(1e-5)
             )
         else:
-            loss_weight = self.get_loss_weight(dsigma, sigma)
+            loss_weight = self._get_loss_weight(dsigma, sigma)
 
         return move_chance, loss_weight
     
@@ -65,30 +65,27 @@ class Masking:
         vanilla_mean = 1 - alpha
         positions = torch.linspace(0, 1, self.T, device=device)
 
+        # Exact integral center
+        e_k = math.exp(self.k)
+        e_km = torch.exp(self.k * vanilla_mean)
+        
+        numerator = e_k - e_km
+        denominator = e_km - 1  
+        center = torch.log(numerator / denominator) / self.k
+
         if position_loss_weighting:
-            # 1. Exact integral center
-            e_k = math.exp(self.k)
-            e_km = torch.exp(self.k * vanilla_mean)
-            
-            numerator = e_k - e_km
-            denominator = e_km - 1  
-            center = torch.log(numerator / denominator) / self.k
-            
             # vanilla_mean_prime = d(1 - alpha)/dt = dsigma * alpha
             vanilla_mean_prime = dsigma * alpha
             c_t_prime = -vanilla_mean_prime * e_km * (e_k - 1) / (numerator * denominator)
             
             logits = self.k * (positions[None, :] - center[:, None])
             move_chance = torch.sigmoid(logits)
-            
             loss_weight = -self.k * (1 - move_chance) * c_t_prime[:, None]
             
-        else:
-            center = alpha
-            
+        else:            
             logits = self.k * (positions[None, :] - center[:, None])
             move_chance = torch.sigmoid(logits)
-            loss_weight = self.get_loss_weight(dsigma, sigma)
+            loss_weight = self._get_loss_weight(dsigma, sigma)
 
         return move_chance, loss_weight
     
