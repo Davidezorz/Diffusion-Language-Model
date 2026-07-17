@@ -1,11 +1,42 @@
-mode: "AR"
+mode: "AR"   # AR | DiT
 caching_directory: '.data/'
-checkpoint: "lightning_logs/version_10/checkpoints/epoch=0-step=175.ckpt"
+checkpoint:       # checkpoints/
+inference_only: false               # true | false
 
 backbone:
-    B: 6                            # ◀ batch dimension
-    T: 384                          # ◀ context window (max sequence length)
+    B: 2                            # ◀ batch dimension
+    T: 1024                      # ◀ context window (max sequence length)
+    T_ctx: 768
+    T_ans: 256
     C: 768                          # ◀ embedding dimension
     N: 22                           # ◀ number of blocks
     H: 12                           # ◀ number of heads
+
+training:
+    max_epochs: 10
+    limit_train_batches: 1.0        # 1.0 il modello vede l'intero dataset
+    limit_val_batches: 1.0
+
+    log_every_n_steps: 1
+
+    debug_subset_size: 5000
+    validation_subset_size: 500
+
+    validation_fraction: 0.05
+    accumulate_grad_batches: 8
+    seed: 42
+
+    learning_rate: 0.00005
+    warmup_steps: 200
+
+diffusion:
+    noise_schedule: "loglinear"
+    
+    corruption_type: "moving_sigmoid"      # independent | position | moving_sigmoid
+    position_gamma: 0.2
+    position_loss_weighting: false
+
+    sigmoid_k: 5
+    calibrated_sigmoid: true
+    
 

@@ -1,6 +1,14 @@
 # weights and logs
 .weights/
 lightning_logs/
+checkpoints/
+
+# markdown
+project.md
+
+# necessities for training
+test_checkpoints.py
+plots.ipynb
 
 # data
 .data/
@@ -46,7 +54,7 @@ MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
 
-# Unit test / coverage reports
+# Unit tests / coverage reports
 htmlcov/
 .tox/
 .nox/

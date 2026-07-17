@@ -1,0 +1,9 @@
+Schedule,Parameter,PositionWeighting,Calibrated,Final_BPD,Final_NLL,Final_PPL
+Independent,-,False,-,4.0998,2.8418,17.1460
+Position,gamma=0.2,False,-,2.2140,1.5347,4.6397
+Position,gamma=0.2,True,-,3.3498,2.3219,10.1948
+MovingSigmoid,k=0.5,False,False,7.2994,5.0595,157.5182
+MovingSigmoid,k=0.5,False,True,6.0158,4.1699,64.7064
+MovingSigmoid,k=1,False,True,3.3428,2.3171,10.1457
+MovingSigmoid,k=2,False,True,3.3736,2.3384,10.3649
+MovingSigmoid,k=5,False,True,2.4781,1.7177,5.5715

@@ -14,7 +14,9 @@ from transformers import AutoModelForCausalLM
 class  GPT(L.LightningModule):
 
     def __init__(self, backbone, tokenizer, T=None,
-                 gen_ppl_model_id='gpt2'):
+                gen_ppl_model_id='gpt2', learning_rate=5e-5,
+                warmup_steps=1000,):
+        
         super().__init__()
         self.weights_folder = '.weights/'
 
@@ -25,6 +27,8 @@ class  GPT(L.LightningModule):
         self.vocab_size = self.tokenizer.vocab_size
 
         self.backbone = backbone
+        self.learning_rate = learning_rate
+        self.warmup_steps=warmup_steps
         """
         # For Generative PPL (External Model)
         self.eval_tokenizer = AutoTokenizer.from_pretrained(gen_ppl_model_id)
@@ -41,14 +45,14 @@ class  GPT(L.LightningModule):
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
             self.backbone.parameters(),
-            lr    = 5e-3,
+            lr    = self.learning_rate,
             betas =(0.9, 0.999),
             eps   = 1e-8,
             weight_decay = 0)
-        
+
         scheduler = transformers.get_constant_schedule_with_warmup(
             optimizer=optimizer,
-            num_warmup_steps=2500
+            num_warmup_steps=self.warmup_steps
         )
         """
         scheduler = torch.optim.lr_scheduler.LinearLR(
@@ -64,6 +68,11 @@ class  GPT(L.LightningModule):
             'monitor': 'val/loss',
             'name': 'trainer/lr',
         }
+
+        print(
+            f"[OPTIMIZER] lr={self.learning_rate}, "
+            f"warmup_steps={self.warmup_steps}"
+        )
         return [optimizer], [scheduler_dict]
     
 
@@ -88,20 +97,37 @@ class  GPT(L.LightningModule):
         outputs = batch['output_ids']
         seqlens = batch.get('attention_mask')
 
-        B, T = batch['input_ids'].shape
+        B, T = inputs.shape
+
         if seqlens is not None:
             seqlens = seqlens.sum(dim=-1) if seqlens.sum() != B*T else None
-        
+
         logits = self.backbone(inputs, seqlens)
         B, T, V = logits.shape
 
-        logits  = logits.view(B*T, V)
-        targets = outputs.view(B*T)
+        targets = outputs.clone()
+        targets[(targets < 0) & (targets != -100)] = -100
+        targets[targets >= V] = -100
 
-        loss = F.cross_entropy(logits, 
-                               targets,
-                               ignore_index=self.tokenizer.pad_token_id)
-        return loss        
+        valid_targets = targets != -100
+
+        if not valid_targets.any():
+            raise RuntimeError(
+                "Training batch without valid targets."
+            )
+
+        loss = F.cross_entropy(
+            logits.reshape(-1, V),
+            targets.reshape(-1),
+            ignore_index=-100
+        )
+
+        if not torch.isfinite(loss):
+            raise RuntimeError(
+                f"Training loss not finite: {loss.item()}"
+            )
+
+        return loss  
 
 
     def loss_qa(self, batch):
@@ -110,29 +136,67 @@ class  GPT(L.LightningModule):
         seqlens = batch.get('attention_mask')
 
         B, T = inputs.shape
+
         if seqlens is not None:
             seqlens = seqlens.sum(dim=-1) if seqlens.sum() != B*T else None
-        
-        logits = self.backbone(inputs, None) # TODO: is sqlens helpful?
+
+        logits = self.backbone(inputs, seqlens)
         B, T, V = logits.shape
 
-        logits  = logits.view(B*T, V)
-        targets = outputs.view(B*T)
+        targets = outputs.clone()
 
-        # Ignore -100: This ignores both PAD tokens and the User's prompts!
-        loss = F.cross_entropy(logits, 
-                            targets,
-                            ignore_index=-100)
+        # ignore everything not valid for CrossEntropy
+        targets[(targets < 0) & (targets != -100)] = -100
+        targets[targets >= V] = -100
+
+        valid_targets = targets != -100
+
+        if not valid_targets.any():
+            raise RuntimeError(
+                "Validation batch without valid targets."
+            )
+
+        loss = F.cross_entropy(
+            logits.reshape(-1, V),
+            targets.reshape(-1),
+            ignore_index=-100
+        )
+
+        if not torch.isfinite(loss):
+            raise RuntimeError(
+                f"Validation loss not finite: {loss.item()}"
+            )
+
         return loss
 
 
     def validation_step(self, batch, batch_idx):
         loss = self.loss_qa(batch)
 
-        self.log('val/loss', loss, on_step=False,
-                 on_epoch=True, sync_dist=True)
-        self.log('val/ppl', torch.exp(loss), on_step=False,
-                 on_epoch=True, sync_dist=True)
+        batch_size = batch["input_ids"].shape[0]
+
+        self.log(
+            "val_loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+
+        self.log(
+            "val/ppl",
+            torch.exp(torch.clamp(loss.detach(), max=20)),
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            logger=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+
         return loss
 
 
@@ -192,22 +256,22 @@ class  GPT(L.LightningModule):
         B = ids.shape[0]
         # Track which sequences in the batch are still generating
         unfinished = torch.ones(B, dtype=torch.bool, device=ids.device)
-        
+
         for _ in range(n_tokens):
             logits = self.backbone(ids)                                         # get the logits
             logits = logits[:, -1, :]                                           # B C
 
             probs = F.softmax(logits/temperature, dim=-1)                       # apply softmax to get probabilities
             id_next = torch.multinomial(probs, num_samples=1)                   # B 1
-            
+
             # If a sequence is already finished, force its next token to be EOS
             id_next[~unfinished] = self.tokenizer.eos_token_id
-            
+
             ids = torch.cat((ids, id_next), dim=1)                              # B T+1
-            
+
             # Update unfinished mask: turn to False if EOS is generated
             unfinished = unfinished & (id_next.squeeze(-1) != self.tokenizer.eos_token_id)
-            
+
             # Break early only if ALL sequences in the batch are finished
             if not unfinished.any():
                 break
