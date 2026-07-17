@@ -3,7 +3,6 @@ import torch
 import os
 import json
 import random
-import nltk
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from scipy import linalg
@@ -789,7 +788,7 @@ class BenchmarkOrchestrator:
     """
     Main Launcher to handle Generation, Evaluation, and Plotting for the AR vs DDM benchmark.
 
-    /vostro_progetto
+    /project_root
     ├── run_benchmarks.py      <-- the Launcher
     ├── /results
     │   ├── /datasets          <-- Here we save the generated samples (prompts, ar, ddm)
@@ -814,6 +813,7 @@ class BenchmarkOrchestrator:
     # ==========================================
     # 1. GENERATION PHASE
     # ==========================================
+
     def generate_and_save_dataset(self, filename="eval_dataset.json", max_samples=None):
         """
         Generates text using both models and saves the prompt, real response, AR, and DDM responses.
@@ -970,3 +970,7 @@ class BenchmarkOrchestrator:
             plt.close()
             
         print(f"✅ Plots generated and saved to {self.dirs['plots']}")
+
+    
+def import_test_set():
+    pass
