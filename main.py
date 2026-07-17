@@ -11,7 +11,7 @@ import utils.utils
 
 from models.AR import AR
 from models.BERT import BERT
-from gpt_lightning import GPT
+from GPT_Lightning import GPT
 
 from models.DiT import DiT
 from diffusion_lightning import Diffusion
