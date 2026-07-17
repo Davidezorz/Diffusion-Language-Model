@@ -379,7 +379,7 @@ class Diffusion(L.LightningModule):
         x = self._sample_prior(B, self.T)                                       # B T   of mask token
 
         timesteps = torch.linspace(1, eps, num_steps + 1, device=self.device)   # ◀─┬ compute the timestes
-        dt = (1 - eps) / num_steps                                              # ◀─╯ and delta timestap
+        dt = (1 - eps) / num_steps                                                   # ◀─╯ and delta timestap
 
         for i in range(num_steps):                                              #  ╮ 
             print(f"\r{i+1} / {num_steps}", end="   ")                          #  │ Timesteps loop
