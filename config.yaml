@@ -17,17 +17,17 @@ training:
     limit_train_batches: 1.0        # 1.0 il modello vede l'intero dataset
     limit_val_batches: 1.0
 
-    log_every_n_steps: 1
+    log_every_n_steps: 25
 
-    debug_subset_size: 5000
-    validation_subset_size: 500
+    debug_subset_size: 50000
+    validation_subset_size: 2500
 
     validation_fraction: 0.05
     accumulate_grad_batches: 8
     seed: 42
 
     learning_rate: 0.00005
-    warmup_steps: 200
+    warmup_steps: 1000
 
 diffusion:
     noise_schedule: "loglinear"
