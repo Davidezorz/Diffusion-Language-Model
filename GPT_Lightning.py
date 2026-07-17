@@ -25,7 +25,7 @@ class  GPT(L.LightningModule):
         self.vocab_size = self.tokenizer.vocab_size
 
         self.backbone = backbone
-
+        """
         # For Generative PPL (External Model)
         self.eval_tokenizer = AutoTokenizer.from_pretrained(gen_ppl_model_id)
         self.eval_model = AutoModelForCausalLM.from_pretrained(gen_ppl_model_id)
@@ -35,6 +35,7 @@ class  GPT(L.LightningModule):
         self.eval_model.eval()
         for p in self.eval_model.parameters():
             p.requires_grad = False
+        """
 
 
     def configure_optimizers(self):
@@ -45,7 +46,6 @@ class  GPT(L.LightningModule):
             eps   = 1e-8,
             weight_decay = 0)
         
-        """
         scheduler = transformers.get_constant_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=2500
@@ -57,7 +57,7 @@ class  GPT(L.LightningModule):
             end_factor=0.1,
             total_iters=2500
         )
-
+        """
         scheduler_dict = {
             'scheduler': scheduler,
             'interval': 'step',
@@ -104,8 +104,30 @@ class  GPT(L.LightningModule):
         return loss        
 
 
+    def loss_qa(self, batch):
+        inputs  = batch['input_ids']
+        outputs = batch['output_ids']
+        seqlens = batch.get('attention_mask')
+
+        B, T = inputs.shape
+        if seqlens is not None:
+            seqlens = seqlens.sum(dim=-1) if seqlens.sum() != B*T else None
+        
+        logits = self.backbone(inputs, None) # TODO: is sqlens helpful?
+        B, T, V = logits.shape
+
+        logits  = logits.view(B*T, V)
+        targets = outputs.view(B*T)
+
+        # Ignore -100: This ignores both PAD tokens and the User's prompts!
+        loss = F.cross_entropy(logits, 
+                            targets,
+                            ignore_index=-100)
+        return loss
+
+
     def validation_step(self, batch, batch_idx):
-        loss = self.loss(batch)
+        loss = self.loss_qa(batch)
 
         self.log('val/loss', loss, on_step=False,
                  on_epoch=True, sync_dist=True)
@@ -115,6 +137,7 @@ class  GPT(L.LightningModule):
 
 
     def on_validation_epoch_end(self):
+        return
         x = torch.full((4, 1), self.tokenizer.bos_token_id, device=self.device)
         samples = self.generate(x, n_tokens=50)
         decoded_samples = self.tokenizer.batch_decode(samples, skip_special_tokens=True)
@@ -150,7 +173,8 @@ class  GPT(L.LightningModule):
             del state_dict[k]                                                   # checkpoint dictionary
 
 
-    def generate(self, ids, n_tokens, temperature=1):
+    @torch.no_grad()
+    def generate_(self, ids, n_tokens, temperature=1):
         for _ in range(n_tokens):
             
             logits = self.backbone(ids)                                         # get the logits
@@ -162,3 +186,64 @@ class  GPT(L.LightningModule):
             ids = torch.cat((ids, id_next), dim=1)                              # B T+1
         return ids
 
+
+    @torch.no_grad()
+    def generate(self, ids, n_tokens, temperature=1):
+        B = ids.shape[0]
+        # Track which sequences in the batch are still generating
+        unfinished = torch.ones(B, dtype=torch.bool, device=ids.device)
+        
+        for _ in range(n_tokens):
+            logits = self.backbone(ids)                                         # get the logits
+            logits = logits[:, -1, :]                                           # B C
+
+            probs = F.softmax(logits/temperature, dim=-1)                       # apply softmax to get probabilities
+            id_next = torch.multinomial(probs, num_samples=1)                   # B 1
+            
+            # If a sequence is already finished, force its next token to be EOS
+            id_next[~unfinished] = self.tokenizer.eos_token_id
+            
+            ids = torch.cat((ids, id_next), dim=1)                              # B T+1
+            
+            # Update unfinished mask: turn to False if EOS is generated
+            unfinished = unfinished & (id_next.squeeze(-1) != self.tokenizer.eos_token_id)
+            
+            # Break early only if ALL sequences in the batch are finished
+            if not unfinished.any():
+                break
+                
+        return ids
+    
+
+    @torch.no_grad()
+    def generate_stream(self, ids, n_tokens, temperature=0.85, top_k=64, top_p=0.95):
+        """
+        Assumes ids has shape (1, T) where B=1.
+        Yields each newly generated token one by one.
+        """
+        for _ in range(n_tokens):
+            logits = self.backbone(ids)[:, -1, :] / temperature
+
+            # Top-K
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = -float('Inf')
+
+            # Top-P
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+            
+            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+            logits[indices_to_remove] = -float('Inf')
+
+            # Sample
+            id_next = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
+            
+            if id_next.item() == self.tokenizer.eos_token_id:
+                break
+                
+            ids = torch.cat((ids, id_next), dim=1)
+            yield id_next.item()

@@ -178,7 +178,7 @@ class MultiHeadAttention(nn.Module):
         
         mask, causal_mask = None, 0
         if seqlens is not None:                                                # ◀── handle sequence length
-            if is_causal: causal_mask = self._create_causal_mask(T, q.device)                # ◀─┤ T T
+            if is_causal: causal_mask = self._create_causal_mask(T, q.device)  # ◀─┤ T T
             mask_seqlen = self._create_seqlens_mask(seqlens, T, q.device)       
             mask =  ~(causal_mask | mask_seqlen).unsqueeze(1)
             is_causal = False
