@@ -11,7 +11,7 @@ import utils.utils
 
 from models.AR import AR
 from models.BERT import BERT
-from GPT_Lightning import GPT
+from gpt_lightning import GPT
 
 from models.DiT import DiT
 from diffusion_lightning import Diffusion
@@ -131,7 +131,7 @@ def main():
     #load_smoltalk()
     #load_smoltal_test()
     test.test_masking_schedule()
-    return
+    # return
     config = OmegaConf.load("config.yaml")                                      # get the config
     mode   = config.mode
 
@@ -232,6 +232,7 @@ def main():
 
     """
     """
+
     print("\ntraining:")
     trainer = L.Trainer(
         max_epochs=1,  
