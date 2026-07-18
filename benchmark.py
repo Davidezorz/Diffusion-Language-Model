@@ -1054,35 +1054,46 @@ if __name__ == '__main__':
     ddm_model_sigm_ckpt = "checkpoints/DiT-moving_sigmoid-epoch=07-val_loss=1.8796.ckpt/DiT-moving_sigmoid-epoch=07-val_loss=1.8796.ckpt"
     ddm_model_posdip_ckpt = "checkpoints/DiT-position-epoch=06-val_loss=1.6808.ckpt/DiT-position-epoch=06-val_loss=1.6808.ckpt"
 
-    print("Loading AR model...")
-    # Initialize Autoregressive backbone and load Lightning checkpoint
-    backbone_ar = AR(V=vocab_size, C=C, H=H, N=N)
-    model_ar = GPT.load_from_checkpoint(ar_model_ckpt,
-                                        backbone=backbone_ar,
-                                        tokenizer=tokenizer,
-                                        T=T,
-                                        learning_rate=lr,
-                                        warmup_steps=wup_steps,
-                                        strict=False).to(device)
+
+    print("Starting benchmark for model")
+    model_to_test = input("Enter model to test ('ar' or 'ddm'): ").strip().lower()
     
-    # print("Loading DDM model...")
-    # Initialize DiT/DDM backbone and load Lightning checkpoint
-    # backbone_ddm = DiT(V=vocab_size, C=C, H=H, N=N)
-    # model_ddm = Diffusion.load_from_checkpoint(ddm_model_unif_ckpt,
-    #                                     backbone=backbone_ddm,
-    #                                     tokenizer=tokenizer,
-    #                                     T_ctx=T_context,
-    #                                     T_ans=T_answer,
-    #                                     learning_rate=lr,
-    #                                     warmup_steps=wup_steps,
-    #                                     strict=False).to(device)
-    
-    ppx = Perplexity(model=model_ar.backbone, 
-                     model_type='ar', 
-                     mask_token_id=tokenizer.mask_token_id, 
-                     vocab_size=vocab_size)
-    ppx_value = ppx.calculate(val_dataloader_ar)
-    
+    if model_to_test=="ar":
+        print("Loading AR model...")
+        # Initialize Autoregressive backbone and load Lightning checkpoint
+        backbone_ar = AR(V=vocab_size, C=C, H=H, N=N)
+        model_ar = GPT.load_from_checkpoint(ar_model_ckpt,
+                                            backbone=backbone_ar,
+                                            tokenizer=tokenizer,
+                                            T=T,
+                                            learning_rate=lr,
+                                            warmup_steps=wup_steps,
+                                            strict=False).to(device)
+
+        ppx = Perplexity(model=model_ar.backbone, 
+                        model_type='ar', 
+                        mask_token_id=tokenizer.mask_token_id, 
+                        vocab_size=vocab_size)
+        ppx_value = ppx.calculate(val_dataloader_ar)
+
+    elif model_to_test=="ddm":
+        print("Loading DDM model...")
+        # Initialize DiT/DDM backbone and load Lightning checkpoint
+        backbone_ddm = DiT(V=vocab_size, C=C, H=H, N=N)
+        model_ddm = Diffusion.load_from_checkpoint(ddm_model_unif_ckpt,
+                                            backbone=backbone_ddm,
+                                            tokenizer=tokenizer,
+                                            T_ctx=T_context,
+                                            T_ans=T_answer,
+                                            learning_rate=lr,
+                                            warmup_steps=wup_steps,
+                                            strict=False).to(device)
+        
+        ppx = Perplexity(model=model_ddm.backbone, 
+                        model_type='ddm', 
+                        mask_token_id=tokenizer.mask_token_id, 
+                        vocab_size=vocab_size)
+        ppx_value = ppx.calculate(val_dataloader_ddm)
     
     
     #
