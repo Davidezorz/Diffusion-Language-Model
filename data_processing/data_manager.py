@@ -146,40 +146,44 @@ class DataManagerQA(DataManagerPreTrain):
 }
         self.group_texts = group_fn_dict[mode]
 
+
     def _tokenize(self, dataset):
-        """ Tokeinze the conversion, in question and answer split """
+        """ Tokenize the conversion, in question and answer split """
         tokenizer = self.tokenizer
         conversations = []
-        IGNORE = -100
 
-        # Pre-compute the prefix to know exactly how many tokens to mask
-        answer_prefix = tokenizer("Assistant: ", 
-                                   add_special_tokens=False)["input_ids"]
+        answer_prefix = tokenizer("Assistant: ",                                # Pre-compute the prefix to know exactly 
+                                   add_special_tokens=False)["input_ids"]       # how many tokens to mask
 
         for messages in dataset["messages"]:
             turns = []
-            current_q = None
+            current_q_parts = []                                                # Use a list to accumulate system + user text
             
             for msg in messages:
                 role, content = msg["role"], msg["content"]
                 
-                if role == "user":
-                    current_q = content
-                elif role == "assistant" and current_q is not None:
-                    q_tok = tokenizer(f"User: {current_q}", 
-                                      add_special_tokens=False)["input_ids"]
+                if role == "system" or role == "user":
+                    current_q_parts.append(content)
+                elif role == "assistant" and current_q_parts:
+                    joined_q = "\n".join(current_q_parts)                     # Combine accumulated system/user messages
+                    
+                    q_tok = tokenizer(f"User: {joined_q}", 
+                                      add_special_tokens=False,
+                                      truncation=False)["input_ids"]
                     q_tok = q_tok + [self.EOS] + answer_prefix
                     
                     a_tok = tokenizer(content, 
-                                      add_special_tokens=False)["input_ids"]
+                                      add_special_tokens=False,
+                                      truncation=False)["input_ids"]
                     a_tok = a_tok + [self.EOS]
                     
                     turns.append({"q": q_tok, "a": a_tok})
-                    current_q = None                                            
+                    current_q_parts = []                                        # Reset for the next turn
                     
             conversations.append(turns)
 
         return {"conversations": conversations}
+
 
     def tokenize(self, dataset, split_name="train"):
         cache_file = os.path.join(
@@ -245,7 +249,10 @@ class DataManagerQA(DataManagerPreTrain):
                 'output_ids': out_blocks, 
                 'attention_mask': mask_blocks}
 
-    def group_texts_ar(self, dataset, T, split_name="train"):
+
+    def group_texts_ar(self, dataset, T=None, T_ctx=None, 
+                       T_ans=None, split_name="train"):
+        if T is None: raise ValueError("ERROR: T not defined")
         group_fn = functools.partial(self._group_ar, T=T)
         cache_file = os.path.join(
             self.caching_directory + "grouped/",
@@ -321,7 +328,11 @@ class DataManagerQA(DataManagerPreTrain):
         }
 
 
-    def group_texts_dit(self, dataset, T_ctx, T_ans, split_name="train"):
+    def group_texts_dit(self, dataset, T=None, T_ctx=None, 
+                       T_ans=None, split_name="train"):
+        if T_ctx is None: raise ValueError("ERROR: T_ctx not defined") 
+        if T_ans is None: raise ValueError("ERROR: T_ans not defined") 
+
         group_fn = functools.partial(self._group_dit, T_ctx=T_ctx, T_ans=T_ans)
         cache_file = os.path.join(
             self.caching_directory + "grouped/",
