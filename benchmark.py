@@ -1,4 +1,4 @@
-import datasets, torch, os, json, random
+import datasets, torch, os, json, random, gc
 import numpy as np
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
@@ -209,20 +209,16 @@ class ChatStructureEvaluator:
     from text models in chat-based scenarios.
     """
     def __init__(self, eos_token_id="<eos>", user_token_id=None):
-        """
-        Initializes the evaluator.
-        - eos_token_id: the ID of the end-of-generation token (e.g., <|endoftext|> or <eos>, default: <eos>).
-        - user_token_id: (Optional) the ID of the user marker (e.g., <user>). 
-                         Used to catch if the model hallucinates and pretends to be the user.
-        """
         self.eos_token_id = eos_token_id
         self.user_token_id = user_token_id
         
-        # Dictionary to accumulate evaluation results
+        # Expanded dictionary to track all specific variants
         self.results = {
             'AR': {'lengths': [], 'missing_eos': 0, 'user_hallucinations': 0},
-            'DDM': {'lengths': [], 'missing_eos': 0, 'user_hallucinations': 0},
-            'REAL': {'lengths': []} # Ground truth lengths for comparison
+            'DDM_unif': {'lengths': [], 'missing_eos': 0, 'user_hallucinations': 0},
+            'DDM_sigm': {'lengths': [], 'missing_eos': 0, 'user_hallucinations': 0},
+            'DDM_posdip': {'lengths': [], 'missing_eos': 0, 'user_hallucinations': 0},
+            'REAL': {'lengths': []}
         }
 
     def _evaluate_single_sequence(self, generated_tokens, prompt_length):
@@ -289,8 +285,10 @@ class ChatStructureEvaluator:
         print("\n" + "="*50)
         print("📊 STRUCTURAL AND TURN LENGTH REPORT")
         print("="*50)
-        
-        for model in ['REAL', 'AR', 'DDM']:
+
+        collected_data = []
+
+        for model in ['REAL', 'AR', 'DDM_unif', 'DDM_sigm', 'DDM_posdip']:
             data = self.results[model]
             lengths = data['lengths']
             
@@ -309,6 +307,15 @@ class ChatStructureEvaluator:
                 err_usr = (data['user_hallucinations'] / total_seqs) * 100
                 print(f"  • Missing EOS:      {err_eos:.1f}% ({data['missing_eos']} occurrences)")
                 print(f"  • User Hallucination:{err_usr:.1f}% ({data['user_hallucinations']} occurrences)")
+            
+            collected_data.append({
+                'model': model,
+                'avg_length': avg_len,
+                'std_length': std_len,
+                'missing_eos': err_eos,
+                'user_hallucinations': err_usr
+            })
+        return collected_data
 
 class DiversityEvaluator:
     """
@@ -951,6 +958,70 @@ class BenchmarkManager:
                         vocab_size=self.vocab_size)
         self.ppx_values['DDM_pos_dip'] = ppx.calculate(self.val_dataloader_dit)
 
+    def run_structure_evaluation(self, precomputed_data=None, auto_save_filepath="precomputed_tokens.pt"):
+        """
+        Runs the ChatStructureEvaluator on the AR model and ALL DDM variants.
+        If precomputed_data is provided, it uses it. Otherwise, it generates the 
+        tokens on the fly and AUTOMATICALLY saves them to disk for future use.
+        """
+        print("\n🔍 Initializing Structure Evaluator...")
+        
+        user_id = self.tokenizer.encode("User", add_special_tokens=False)[0] if "User" in self.tokenizer.vocab else None
+        
+        evaluator = ChatStructureEvaluator(
+            eos_token_id=self.tokenizer.eos_token_id,
+            user_token_id=user_id
+        )
+        
+        models_to_evaluate = [
+            ("AR", "ar", None),
+            ("DDM_unif", "ddm", "unif"),
+            ("DDM_sigm", "ddm", "sigm"),
+            ("DDM_posdip", "ddm", "posdip")
+        ]
+        
+        # Dictionary to catch any tokens we generate on the fly
+        newly_generated_data = {}
+        
+        for name, m_type, m_variant in models_to_evaluate:
+            print(f"\n--- Evaluating Structure for {name} ---")
+            
+            if precomputed_data is not None and name in precomputed_data:
+                print(f"📦 Loading precomputed tokens for {name} (Skipping VRAM upload)...")
+                tokens, lengths = precomputed_data[name]
+            else:
+                print(f"⚙️ No precomputed data found. Generating tokens for {name}...")
+                tokens, lengths = self.generate_answers(model_type=m_type, model_variant=m_variant)
+                
+                # Store the newly generated data so we can save it later
+                newly_generated_data[name] = (tokens, lengths)
+                
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+            
+            evaluator.add_batch_results(
+                model_name=name, 
+                batch_generated_ids=tokens, 
+                prompt_lengths=lengths
+            )
+            
+        if newly_generated_data:
+            print(f"\n💾 Auto-saving newly generated tokens to {auto_save_filepath}...")
+            # If we had partial precomputed data, merge the new stuff into it before saving
+            if precomputed_data is not None:
+                precomputed_data.update(newly_generated_data)
+                data_to_save = precomputed_data
+            else:
+                data_to_save = newly_generated_data
+                
+            torch.save(data_to_save, auto_save_filepath)
+            print("✅ Auto-save complete!")
+
+        # Print the final report
+        collector = evaluator.print_report()
+        return collector
+
     def generate_token_answers(self, model_type = "ar", model_variant="unif"):
         """
         Generates answers for a given model type (AR or DDM).
@@ -961,16 +1032,21 @@ class BenchmarkManager:
         current_model.eval()
         dataloader = self.val_dataloader_ar if model_type == "ar" else self.val_dataloader_dit
         generated_answers = []
+        prompt_lengths = []
         with torch.no_grad():
             for batch in tqdm(dataloader, desc=f"Generating answers for {model_type.upper()}"):
                 prompts = batch['input_ids'].to(self.device)
+                batch_prompt_lengths = (batch['attention_mask'].sum(dim=1) - 1).tolist()  # Exclude EOS token
                 if model_type == "ddm":
                     # For DDM, we need to run the unmasking loop
                     outputs = current_model.generate(prompts, n_tokens=100, num_steps=20)
                 else:
                     outputs = current_model.generate(prompts, max_length=100)
                 generated_answers.extend(outputs.cpu().numpy())
-        return generated_answers
+                prompt_lengths.extend(batch_prompt_lengths)
+        gc.collect()
+        torch.cuda.empty_cache()
+        return generated_answers, prompt_lengths
 
     def decode_tokens_to_text(self, token_list, prompt_length=None):
         """
@@ -991,6 +1067,49 @@ class BenchmarkManager:
             text_answers.append(text)
             
         return text_answers
+
+    def save_generated_tokens_to_disk(self, filepath="precomputed_tokens.pt"):
+        """
+        Generates answers for all models and saves the raw tokens to a file.
+        Run this ONCE when you have GPU access.
+        """
+        print(f"\n💾 Generating and saving all tokens to {filepath}...")
+        data = {}
+        
+        data['AR'] = self.generate_token_answers(model_type="ar")
+        data['DDM_unif'] = self.generate_token_answers(model_type="ddm", model_variant="unif")
+        data['DDM_sigm'] = self.generate_token_answers(model_type="ddm", model_variant="sigm")
+        data['DDM_posdip'] = self.generate_token_answers(model_type="ddm", model_variant="posdip")
+        
+        torch.save(data, filepath)
+        print("✅ Generation complete and saved securely!")
+
+    def load_precomputed_tokens(self, filepath="precomputed_tokens.pt"):
+        """Loads the precomputed token dictionary from disk."""
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Could not find {filepath}. Generate it first!")
+        
+        print(f"📂 Loading tokens from {filepath}...")
+        return torch.load(filepath)
+
+
+if __name__ == "__main__":
+    manager = BenchmarkManager(config_path="config.yaml")
+
+    manager.tokenize_and_group()
+    manager.run_perplexity_benchmark()
+    manager.run_structure_evaluation(precomputed_data=None)  # Set to None to generate tokens
+
+
+
+
+
+
+
+
+
+
+
 
 
 
