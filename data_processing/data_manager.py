@@ -290,8 +290,8 @@ class DataManagerQA(DataManagerPreTrain):
                     target_a = target_a[:T_ans]                                 # Slicing answer to fit maximum allowed window
                     
                 ctx_ids = []
-                if len(target_q) >= T_ctx - 1:
-                    ctx_ids = target_q[-(T_ctx - 1):]                           # Question is massive, take only the end
+                if len(target_q) >= T_ctx - 1:                                  # TODO: we should add "User :" at the beginning
+                    ctx_ids = target_q[-(T_ctx - 1):]                           # Question is massive, take only the end 
                 else:
                     ctx_ids = target_q
                     hist_idx = target_idx - 1

@@ -4,8 +4,6 @@ import datasets
 
 from omegaconf import OmegaConf
 
-import noise.noise_schedule as noise_schedule
-import noise.masking_schedule as masking_schedule
 from data_processing.data_manager import DataManagerQA
 import utils.utils
 from models.AR import AR
@@ -14,6 +12,9 @@ from models.DiT import DiT
 
 from GPT_Lightning import GPT
 from diffusion_lightning import Diffusion
+
+import noise.noise_schedule as noise_schedule
+import noise.masking_schedule as masking_schedule
 
 import data_processing.samplers as samplers
 from utils.transfer_weights import *
