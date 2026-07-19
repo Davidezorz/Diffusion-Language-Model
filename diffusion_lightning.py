@@ -1,10 +1,7 @@
 import itertools
 import math
-import os
-import typing
 from dataclasses import dataclass
 
-import hydra.utils
 import lightning as L
 import numpy as np
 import torch
@@ -13,11 +10,13 @@ import torchmetrics
 import transformers
 
 import models
-import noise_schedule
+import noise.noise_schedule as noise_schedule
 import utils
 
-import models.masking_schedule as masking_schedule
+# import models.masking_schedule as masking_schedule
 import models.noise_schedule as noise_schedule
+import noise.masking_schedule as masking_schedule
+
 
 LOG2 = math.log(2)
 
@@ -69,17 +68,20 @@ class Perplexity(NLL):
 class Diffusion(L.LightningModule):
     def __init__(self,
                  backbone,
-                 tokenizer: transformers.PreTrainedTokenizer,
-                 T:         int = 512
+                 tokenizer:         transformers.PreTrainedTokenizer,
+                 masking_schedule:  masking_schedule.Masking,                   # class in file noise/masking_schedule.py
+                 T_ans:             int,
+                 learning_rate:     float = 5e-5,
+                 warmup_steps:      int   = 1000,
                 ):
         super().__init__()
         self.weights_folder = 'weights/' 
 
-        self.T          = T
         self.tokenizer  = tokenizer
         self.V          = self.tokenizer.vocab_size
         self.mask_index = self.tokenizer.mask_token_id
         mask_token      = self.tokenizer.mask_token
+        self.T_ans      = T_ans
         
         if (not hasattr(self.tokenizer, 'mask_token') or mask_token is None):   # ◀╮ Define the mask token
             self.mask_index = self.V                                            #  │ if it is not already
@@ -99,26 +101,20 @@ class Diffusion(L.LightningModule):
         self.valid_metrics = metrics.clone(prefix='val/')                       #  │ 
         self.test_metrics  = metrics.clone(prefix='test/')                      #  ╯
 
-        self.noise = noise_schedule.LogLinearNoise()
+        self.noise = masking_schedule.noise
+        self.masking_schedule = masking_schedule
 
-        self.corruption_type = "independent"  # "independent", "position", "moving_sigmoid"
-
-        self.position_gamma = 0.2
-        self.position_loss_weighting = False
-
-        self.sigmoid_k = 10.0
-        self.calibrated_sigmoid = False
-
-        self.lr                = 5e-5
-        self.warmup_steps      = 1000
+        self.lr                = learning_rate
+        self.warmup_steps      = warmup_steps
         self.sampling_eps      = 1e-3
-        self.time_conditioning = True
-        self.neg_infinity      = -1000000.0
         
         self.fast_forward_epochs  = None
         self.fast_forward_batches = None
 
         self.antithetic_sampling = True
+
+        self.IGNORE_IDX   = -100
+        self.neg_infinity = -1000000.0
 
 
     def on_save_checkpoint(self, checkpoint):
@@ -166,11 +162,13 @@ class Diffusion(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         attention_mask = batch["attention_mask"] if "attention_mask" in batch else None
+        ans_start_idx = batch.get('ans_start_idx', None)
 
         losses = self._loss(
-            batch["input_ids"],
-            batch["output_ids"],
-            attention_mask
+            input_ids     =batch["input_ids"],
+            output_ids    =batch["output_ids"],
+            attention_mask=attention_mask,
+            ans_start_idx =ans_start_idx
         )
 
         loss = losses.loss
@@ -194,6 +192,7 @@ class Diffusion(L.LightningModule):
 
         return loss
     
+
     def validation_step(self, batch, batch_idx):
         attention_mask = batch.get("attention_mask")
 
@@ -228,20 +227,29 @@ class Diffusion(L.LightningModule):
         return losses.loss
     
 
-    def _loss(self, input_ids, output_ids, attention_mask):
+    def _loss(self, input_ids, output_ids, 
+              attention_mask=None, ans_start_idx=None):
         B, T = input_ids.shape
 
-        loss_mask = output_ids != -100
+        if ans_start_idx is None:                                              # If we don't know where the answers start, we assume
+            ans_start_idx = ans_start_idx = torch.full(                        # the answers are at the end of the tensor
+                    (B,),
+                    T - self.T_ans, 
+                    dtype=torch.long,
+                    device=input_ids.device,
+                )            
+
+        loss_mask = output_ids != self.IGNORE_IDX                               # We ignore the loss when the tokens_id will be self.IGNORE_IDX
 
         if attention_mask is not None:
             loss_mask = loss_mask & attention_mask.bool()
 
         loss = self._forward_pass_diffusion(
-        input_ids=input_ids,
-        output_ids=output_ids,
-        noise_mask=loss_mask,
-        attention_mask=attention_mask,
-    )
+            input_ids     =input_ids,
+            output_ids    =output_ids,
+            attention_mask=attention_mask,
+            ans_start_idx =ans_start_idx
+        )
 
         nlls = loss * loss_mask
         count = loss_mask.sum().clamp_min(1)
@@ -254,62 +262,33 @@ class Diffusion(L.LightningModule):
         )
 
 
-
-    def _forward_pass_diffusion(self, input_ids, output_ids, noise_mask=None, attention_mask=None):
+    def _forward_pass_diffusion(self, input_ids, output_ids, 
+                                attention_mask=None,
+                                ans_start_idx=None):
         B, T = input_ids.shape
         t = self._sample_t(B, input_ids.device)
 
         sigma, _ = self.noise(t)
+        move_chance, loss_weight = self.masking_schedule(t)
 
-        if self.corruption_type == "independent":
-            move_chance, loss_weight = masking_schedule.vanilla_masking(
-                t=t,
-                T=T,
-                device=input_ids.device,
-                noise=self.noise,
-            )
-
-        elif self.corruption_type == "position":
-            move_chance, loss_weight = masking_schedule.position_dependent_masking(
-                t=t,
-                T=T,
-                device=input_ids.device,
-                noise=self.noise,
-                gamma=self.position_gamma,
-                position_loss_weighting=self.position_loss_weighting,
-            )
-
-        elif self.corruption_type == "moving_sigmoid":
-            move_chance, loss_weight = masking_schedule.moving_sigmoid_masking(
-                t=t,
-                T=T,
-                device=input_ids.device,
-                noise=self.noise,
-                k=self.sigmoid_k,
-                calibrated=self.calibrated_sigmoid,
-            )
-
-        else:
-            raise ValueError(f"Unknown corruption type: {self.corruption_type}")
-
-        xt = self.q_xt(
-            input_ids,
-            move_chance,
-            noise_mask=noise_mask,
+        xt = self.q_xt(                                                         # get the corrupted x at time t
+            x            =input_ids,
+            p            =move_chance,
+            ans_start_idx=ans_start_idx,
         )
 
-        seqlens = None
+        seqlens = None                                                          # TODO: could be faster not to use it
         if attention_mask is not None:
             seqlens = attention_mask.sum(dim=-1).long()
 
         model_output = self.forward(
-        xt,
-        sigma[:, None],
-        seqlens=seqlens,
+            xt,
+            sigma[:, None],
+            seqlens=seqlens,
         )
 
         safe_output_ids = output_ids.clone()
-        safe_output_ids[safe_output_ids == -100] = 0
+        safe_output_ids[safe_output_ids == self.IGNORE_IDX] = 0
 
         log_p_theta = torch.gather(
             input=model_output,
@@ -317,6 +296,8 @@ class Diffusion(L.LightningModule):
             index=safe_output_ids[:, :, None],
         ).squeeze(-1)
 
+        loss_weight = self._scatter_to_answer(loss_weight, ans_start_idx,   # we allign the loss weight values
+                                              T, fill_value=1)              # with the answer
         return -log_p_theta * loss_weight
     
 
@@ -329,15 +310,35 @@ class Diffusion(L.LightningModule):
 
         t = (1 - self.sampling_eps) * sample + self.sampling_eps
         return t
-    
 
-    def q_xt(self, x, p, noise_mask=None):
-        move_indices = torch.rand(x.shape, device=x.device) < p
 
-        if noise_mask is not None:
-            move_indices = move_indices & noise_mask.bool()
+    def q_xt(self, x, p, ans_start_idx):
+        """Corrupt the answer by putting MASK according to probability p."""
+        B, T = x.shape
 
-        return torch.where(move_indices, self.mask_index, x)
+        move_indices = torch.rand(B, self.T_ans, device=x.device) < p           # B T_ans, actual mask block
+        full_mask = self._scatter_to_answer(move_indices, ans_start_idx, T)
+
+        return torch.where(full_mask, self.mask_index, x)                       # returns the text corrupted on the answer            
+
+
+    def _scatter_to_answer(self, values, ans_start_idx, T, fill_value=0):
+        """Scatter a B x T_ans tensor into a B x T tensor at the answer positions."""
+        B = values.shape[0]
+
+        out = torch.full((B, T), fill_value,                                     # Full mask initialized to `fill_value`
+                         dtype=values.dtype,
+                         device=values.device,
+                        )
+
+        positions = ans_start_idx[:, None] + torch.arange(                      # B T_ans, for QA we corrupt only the part
+            self.T_ans, device=values.device, dtype=torch.long                  # where the answer lives, that starts at
+        )[None, :]                                                              # ans_start_idx (which has dim B) 
+
+        rows = torch.arange(B, device=values.device)[:, None]                   # B 1
+        out[rows, positions] = values                                           # Scatter values to the answer positions
+
+        return out
 
 
     def forward(self, x, sigma, seqlens=None):
@@ -354,8 +355,7 @@ class Diffusion(L.LightningModule):
 
 
     def _subs_parameterization(self, logits, xt):
-        # log prob at the mask index = - infinity
-        logits[:, :, self.mask_index] += self.neg_infinity
+        logits[:, :, self.mask_index] += self.neg_infinity                      # log prob at the mask index = -infinity -> p(mask)=0          
         
         # Normalize the logits such that x.exp() is
         # a probability distribution over vocab_size.
@@ -379,7 +379,7 @@ class Diffusion(L.LightningModule):
         x = self._sample_prior(B, self.T)                                       # B T   of mask token
 
         timesteps = torch.linspace(1, eps, num_steps + 1, device=self.device)   # ◀─┬ compute the timestes
-        dt = (1 - eps) / num_steps                                                   # ◀─╯ and delta timestap
+        dt = (1 - eps) / num_steps                                              # ◀─╯ and delta timestap
 
         for i in range(num_steps):                                              #  ╮ 
             print(f"\r{i+1} / {num_steps}", end="   ")                          #  │ Timesteps loop
@@ -401,7 +401,7 @@ class Diffusion(L.LightningModule):
         move_chance_t = 1 - torch.exp(-sigma_t)[:, None, None]                  # B 1 1
         move_chance_s = 1 - torch.exp(-sigma_s)[:, None, None]                  # B 1 1
  
-        log_p_x0 = self.forward(x, sigma_t )                                    # B T V
+        log_p_x0 = self.forward(x, sigma_t)                                     # B T V
         
         # Technically, this isn't q_xs since there's a division term that
         # is missing. This division term doesn't affect the samples

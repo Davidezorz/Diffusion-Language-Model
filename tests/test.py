@@ -82,7 +82,36 @@ def test_train_loader(train_loader):
         print(f"output_ids: {batch['output_ids'].shape}")
         print(f"seqlens:    {seqlens.shape}\n")
         break
-    
+
+
+
+
+
+def print_example_train_loader(train_loader, tokenizer):
+    bos = tokenizer.bos_token_id
+    eos = tokenizer.eos_token_id
+    pad = tokenizer.pad_token_id
+
+    print("\nExample conversation:\n")
+
+    batch = next(iter(train_loader))
+
+    ids = batch["input_ids"][0].tolist()           # first sample
+    mask = batch["attention_mask"][0].tolist()
+
+    # Remove padding using the attention mask
+    ids = [t for t, m in zip(ids, mask) if m]
+
+    text = []
+
+    for tok in ids:
+        if tok == eos:
+            text.append("\n\n")                    # conversation separator
+        else:
+            text.append(tokenizer.decode([tok], 
+                                         clean_up_tokenization_spaces=False))
+
+    print("".join(text))
 
 
 
@@ -119,26 +148,35 @@ def test_model(model, tokenizer, mode):
 
 
 
-from masking_schedule import Masking
-from noise_schedule import LogLinearNoise
+from noise.masking_schedule import Masking
+from noise.noise_schedule import LogLinearNoise
 from utils.utils import getDevice
 
 def test_masking_schedule():
     device = getDevice()
     noise = LogLinearNoise()
     B, T = 2, 10
-    masking = Masking(T=T, noise=noise, k=10, gamma=0.2)
+    masking = Masking(T=T, noise=noise, corruption_type='independent', 
+                      k=10, gamma=0.2)
 
-    t = torch.zeros(B, device=device) + 0.5
-    vanilla, vanilla_w  = masking.vanilla_masking(t, True)
+    t = torch.zeros(B, device=device) + 0.9
+    print(f"Noise: {1-torch.exp(-noise(t)[0])} \n")
+
+
+    vanilla, vanilla_w  = masking(t)
+    print(f"vanilla mean: {torch.mean(vanilla, dim=-1)}")
     print(f"vanilla:      \n{vanilla}")
     print(f"vanilla_w:    \n{vanilla_w}\n\n")
 
-    positional, positional_w = masking.position_dependent_masking(t, True)
+    masking.change_corruption_type('position')
+    positional, positional_w = masking(t)
+    print(f"positional mean: {torch.mean(positional, dim=-1)}")
     print(f"positional:   \n{positional}")
     print(f"positional_w: \n{positional_w}\n\n")
     
-    sigmoid, sigmoid_w = masking.moving_sigmoid_masking(t, True)
+    masking.change_corruption_type('moving_sigmoid')
+    sigmoid, sigmoid_w = masking(t)
+    print(f"sigmoid mean: {torch.mean(sigmoid, dim=-1)}")
     print(f"sigmoid:      \n{sigmoid}")
     print(f"sigmoid_w:    \n{sigmoid_w}\n\n")
     

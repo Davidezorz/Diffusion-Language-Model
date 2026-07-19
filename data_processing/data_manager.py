@@ -321,10 +321,10 @@ class DataManagerQA(DataManagerPreTrain):
                 ans_start_idxs.append(len(ctx_ids))                             # Pass the exact boundary index!
 
         return {
-            'input_ids':  in_blocks, 
-            'output_ids': label_blocks, 
+            'input_ids':      in_blocks, 
+            'output_ids':     label_blocks, 
             'attention_mask': attn_masks, 
-            'ans_start_idx': ans_start_idxs
+            'ans_start_idx':  ans_start_idxs
         }
 
 

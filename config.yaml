@@ -1,25 +1,25 @@
-mode: "AR"   # AR | DiT
-caching_directory: '.data/'
-checkpoint:       # checkpoints/
-inference_only: false               # true | false
+mode: "DiT"   # AR | DiT
+caching_directory:  '.data/'
+checkpoint:         false # '.weights/AR-epoch=07-val_loss=1.3041.ckpt'  # checkpoints/
+inference_only:     false           # true | false
 
 backbone:
     B: 2                            # ◀ batch dimension
-    T: 1024                      # ◀ context window (max sequence length)
-    T_ctx: 768
-    T_ans: 256
+    T: 768                          # ◀ context window AR (max sequence length)
+    T_ctx: 256                      # ◀ context window   Diffusion 
+    T_ans: 128                      # ◀ denoising window Diffusion 
     C: 768                          # ◀ embedding dimension
     N: 22                           # ◀ number of blocks
     H: 12                           # ◀ number of heads
 
 training:
-    max_epochs: 10
+    max_epochs: 1
     limit_train_batches: 1.0        # 1.0 il modello vede l'intero dataset
     limit_val_batches: 1.0
 
     log_every_n_steps: 1
 
-    debug_subset_size: 5000
+    debug_subset_size: 500
     validation_subset_size: 500
 
     validation_fraction: 0.05
