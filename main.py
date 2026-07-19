@@ -63,7 +63,7 @@ def load_shakespeare(caching_directory,
 def load_smoltalk():
     ds = datasets.load_dataset("HuggingFaceTB/smoltalk",
                                "all",
-                               split="train[:10%]",                             # TODO: change it back to 'train'
+                               split="train[:25%]",                             # TODO: change it back to 'train'
                                cache_dir=".data"
                               )
     return ds
@@ -283,16 +283,16 @@ def main():
 
     else:
         train_process_tokens = data_manager.group_texts_dit(
-            train_tokens,
-            config.backbone.T_ctx,
-            config.backbone.T_ans,
+            dataset=train_tokens,
+            T_ctx=config.backbone.T_ctx,
+            T_ans=config.backbone.T_ans,
             split_name="train",
         )
 
         val_process_tokens = data_manager.group_texts_dit(
-            val_tokens,
-            config.backbone.T_ctx,
-            config.backbone.T_ans,
+            dataset = val_tokens,
+            T_ctx=config.backbone.T_ctx,
+            T_ans=config.backbone.T_ans,
             split_name="validation",
         )
 
