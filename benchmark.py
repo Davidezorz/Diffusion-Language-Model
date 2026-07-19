@@ -811,6 +811,192 @@ class DiffusionTrajectoryEvaluator:
             }
         return trajectory
 
+class BenchmarkManager:
+    """
+    Manages the entire benchmarking process for AR and DDM models.
+    Handles dataset loading, tokenization, DataLoader creation, and evaluation.
+    """
+    def __init__(self, config_path="config.yaml"):
+        self.config = OmegaConf.load(config_path)
+
+        self.caching_dir = self.config.caching_directory 
+        self.device = getDevice()
+        self.test_ds = self.load_smoltal_test()
+        self.T = self.config.backbone.T
+        self.T_context = self.config.backbone.T_ctx
+        self.T_answer = self.config.backbone.T_ans
+        self.B = self.config.backbone.B
+        self.C = self.config.backbone.C
+        self.H = self.config.backbone.H  
+        self.N = self.config.backbone.N
+        self.lr = self.config.training.learning_rate
+        self.wup_steps = self.config.training.warmup_steps
+
+        self.tokenizer = AutoTokenizer.from_pretrained("jhu-clsp/ettin-decoder-150m")
+        self.vocab_size = len(self.tokenizer)
+        self.dm_qa = DataManagerQA(caching_directory=self.caching_dir, 
+                                   tokenizer=self.tokenizer,  
+                                   n_processes=0)
+        
+        self.ar_model_ckpt = "checkpoints/AR-epoch=07-val_loss=1.3041.ckpt/AR-epoch=07-val_loss=1.3041.ckpt"
+        self.ddm_model_unif_ckpt = "checkpoints/DiT-independent-epoch=09-val_loss=1.7500.ckpt/DiT-independent-epoch=09-val_loss=1.7500.ckpt"
+        self.ddm_model_sigm_ckpt = "checkpoints/DiT-moving_sigmoid-epoch=07-val_loss=1.8796.ckpt/DiT-moving_sigmoid-epoch=07-val_loss=1.8796.ckpt"
+        self.ddm_model_posdip_ckpt = "checkpoints/DiT-position-epoch=06-val_loss=1.6808.ckpt/DiT-position-epoch=06-val_loss=1.6808.ckpt"
+
+    def load_smoltal_test(self):
+        ds = datasets.load_dataset("HuggingFaceTB/smoltalk",
+                                "all",
+                                split="test[:10%]",                          
+                                cache_dir=".data"
+                                )
+        print(ds.cache_files)
+        print(len(ds))
+        return ds
+    
+    def tokenize_and_group(self):
+        # 4. Tokenize and Group the Dataset
+        print("Tokenizing and grouping dataset...")
+        tokenized_ds = self.dm_qa.tokenize(self.test_ds, split_name="test")
+        
+        # Choose a context window size (T) that fits your GPU memory
+        grouped_ds = self.dm_qa.group_texts_ar(tokenized_ds, T=self.T, split_name="test")
+        grouped_ds = self.dm_qa.group_texts_dit(tokenized_ds, T_ctx=self.T_context, T_ans=self.T_answer, split_name="test")
+
+        
+        # 5. Format for PyTorch
+        # Hugging Face and your benchmark expect 'labels', but DataManagerQA outputs 'output_ids'
+        grouped_ds_ar = grouped_ds.rename_column("output_ids", "labels")
+        grouped_ds_ar.set_format(type="torch", columns=["input_ids", "labels", "attention_mask"])
+        grouped_ds_dit = grouped_ds.rename_column("output_ids", "labels")
+        grouped_ds_dit.set_format(type="torch", columns=["input_ids", "labels", "attention_mask"])
+        
+        # 6. Create the DataLoader
+        # B is the batch size. We use the built-in getTrainloader method.
+        self.val_dataloader_ar = self.dm_qa.getTrainloader(grouped_ds_ar, B=self.B)
+        self.val_dataloader_dit = self.dm_qa.getTrainloader(grouped_ds_dit, B=self.B)
+
+    def model(self, model_to_test = "ar", model_variant="unif"):
+        models = {
+            "ar": self._upload_models_ar(),
+            "ddm": self._upload_models_ddm(model_variant=model_variant)
+        }
+        return models[model_to_test]
+    
+    def _upload_models_ar(self):
+        print("Loading AR model...")
+        # Initialize Autoregressive backbone and load Lightning checkpoint
+        backbone_ar = AR(V=self.vocab_size, C=self.C, H=self.H, N=self.N)
+        model_ar = GPT.load_from_checkpoint(self.ar_model_ckpt,
+                                            backbone=backbone_ar,
+                                            tokenizer=self.tokenizer,
+                                            T=self.T,
+                                            learning_rate=self.lr,
+                                            warmup_steps=self.wup_steps,
+                                            strict=False).to(self.device)
+        return model_ar
+
+    def _upload_models_ddm(self, model_variant="unif"):
+        print("Loading DDM model...")
+        model_ckpt_map = {
+            "unif": self.ddm_model_unif_ckpt,
+            "sigm": self.ddm_model_sigm_ckpt,
+            "posdip": self.ddm_model_posdip_ckpt
+        }
+        # Initialize DiT/DDM backbone and load Lightning checkpoint
+        backbone_ddm = DiT(V=self.vocab_size, C=self.C, H=self.H, N=self.N)
+        self.model_ddm = Diffusion.load_from_checkpoint(model_ckpt_map[model_variant],
+                                            backbone=backbone_ddm,
+                                            tokenizer=self.tokenizer,
+                                            T_ctx=self.T_context,
+                                            T_ans=self.T_answer,
+                                            learning_rate=self.lr,
+                                            warmup_steps=self.wup_steps,
+                                            strict=False).to(self.device)
+        return self.model_ddm
+
+    def run_perplexity_benchmark(self):
+        """This method runs the perplexity benchmark for all models (AR and all 3 DDM variants)."""
+        self.ppx_values = {
+            "AR": None,
+            "DDM_uniform": None,
+            "DDM_sigmoid": None,
+            "DDM_pos_dip": None
+        }
+
+        print("Calculating Perplexity for AR model...")
+        ppx = Perplexity(model=self.model("ar").backbone, 
+                        model_type='ar', 
+                        mask_token_id=self.tokenizer.mask_token_id, 
+                        vocab_size=self.vocab_size)
+        self.ppx_values['AR'] = ppx.calculate(self.val_dataloader_ar)
+
+        print("Calculating Perplexity for DDM model, uniform...")
+        ppx = Perplexity(model=self.model("ddm", model_variant="unif"), 
+                        model_type='ddm', 
+                        mask_token_id=self.tokenizer.mask_token_id, 
+                        vocab_size=self.vocab_size)
+        self.ppx_values['DDM_uniform'] = ppx.calculate(self.val_dataloader_dit)
+
+        print("Calculating Perplexity for DDM model, sigmoid...")
+        ppx = Perplexity(model=self.model("ddm", model_variant="sigm"), 
+                        model_type='ddm', 
+                        mask_token_id=self.tokenizer.mask_token_id, 
+                        vocab_size=self.vocab_size)
+        self.ppx_values['DDM_sigmoid'] = ppx.calculate(self.val_dataloader_dit)
+
+        print("Calculating Perplexity for DDM model, positional dipendent...")
+        ppx = Perplexity(model=self.model("ddm", model_variant="posdip"), 
+                        model_type='ddm', 
+                        mask_token_id=self.tokenizer.mask_token_id, 
+                        vocab_size=self.vocab_size)
+        self.ppx_values['DDM_pos_dip'] = ppx.calculate(self.val_dataloader_dit)
+
+    def generate_token_answers(self, model_type = "ar", model_variant="unif"):
+        """
+        Generates answers for a given model type (AR or DDM).
+        Returns a list of generated responses.
+        """
+        # given the dataset test_ds, we will generate answers for each prompt
+        current_model = self.model(model_type, model_variant=model_variant)
+        current_model.eval()
+        dataloader = self.val_dataloader_ar if model_type == "ar" else self.val_dataloader_dit
+        generated_answers = []
+        with torch.no_grad():
+            for batch in tqdm(dataloader, desc=f"Generating answers for {model_type.upper()}"):
+                prompts = batch['input_ids'].to(self.device)
+                if model_type == "ddm":
+                    # For DDM, we need to run the unmasking loop
+                    outputs = current_model.generate(prompts, n_tokens=100, num_steps=20)
+                else:
+                    outputs = current_model.generate(prompts, max_length=100)
+                generated_answers.extend(outputs.cpu().numpy())
+        return generated_answers
+
+    def decode_tokens_to_text(self, token_list, prompt_length=None):
+        """
+        Transforms a list of token arrays into human-readable text.
+        If prompt_length is provided, it slices off the prompt and returns only the generated answer.
+        """
+        text_answers = []
+        
+        for tokens in tqdm(token_list, desc="Decoding tokens to text"):
+            # If a prompt length is provided, slice the array to get only the new tokens
+            if prompt_length is not None:
+                response_tokens = tokens[prompt_length:]
+            else:
+                response_tokens = tokens
+                
+            # Decode the tokens back into a string, ignoring padding and special tokens
+            text = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
+            text_answers.append(text)
+            
+        return text_answers
+
+
+
+
+
+
 #==========================================
 # MAIN BENCHMARK ORCHESTRATOR
 #==========================================
@@ -879,7 +1065,7 @@ class BenchmarkOrchestrator:
                 ar_gen = self.model_ar.generate(prompts, max_length=100)
                 
                 # 2. Get DDM Generation (Replace with your specific DDM unmasking loop)
-                ddm_gen = self.model_ddm.generate_with_unmasking_policy(prompts, steps=20)
+                ddm_gen = self.model_ddm.generate(prompts, steps=20)
                 
                 # Note: Decode the tensors to strings here before saving to JSON!
                 # dataset['prompts'].extend(decoded_prompts)
@@ -1000,131 +1186,3 @@ class BenchmarkOrchestrator:
             plt.close()
             
         print(f"✅ Plots generated and saved to {self.dirs['plots']}")
-
-
-def load_smoltal_test():
-    ds = datasets.load_dataset("HuggingFaceTB/smoltalk",
-                               "all",
-                               split="test[:10%]",                          
-                               cache_dir=".data"
-                              )
-    print(ds.cache_files)
-    print(len(ds))
-    return ds
-    
-if __name__ == '__main__':
-    test_ds = load_smoltal_test()
-    
-    # 3. Initialize the Data Manager
-    config = OmegaConf.load("config.yaml")
-    caching_dir = config.caching_directory 
-    T = config.backbone.T
-    T_context = config.backbone.T_ctx
-    T_answer = config.backbone.T_ans
-    B = config.backbone.B
-    tokenizer = AutoTokenizer.from_pretrained(
-        "jhu-clsp/ettin-decoder-150m",
-    )
-
-
-    # Using 'AR' mode since it handles the -100 masking for conversational prompts
-    dm_qa = DataManagerQA(caching_directory=caching_dir, 
-                          tokenizer=tokenizer,  
-                          n_processes=0)
-    
-    # 4. Tokenize and Group the Dataset
-    print("Tokenizing and grouping dataset...")
-    tokenized_ds = dm_qa.tokenize(test_ds, split_name="test")
-    
-    # Choose a context window size (T) that fits your GPU memory
-    grouped_ds = dm_qa.group_texts_ar(tokenized_ds, T=T, split_name="test")
-    grouped_ds = dm_qa.group_texts_dit(tokenized_ds, T_ctx=T_context, T_ans=T_answer, split_name="test")
-
-    
-    # 5. Format for PyTorch
-    # Hugging Face and your benchmark expect 'labels', but DataManagerQA outputs 'output_ids'
-    grouped_ds_ar = grouped_ds.rename_column("output_ids", "labels")
-    grouped_ds_ar.set_format(type="torch", columns=["input_ids", "labels", "attention_mask"])
-    grouped_ds_dit = grouped_ds.rename_column("output_ids", "labels")
-    grouped_ds_dit.set_format(type="torch", columns=["input_ids", "labels", "attention_mask"])
-    
-    # 6. Create the DataLoader
-    # B is the batch size. We use the built-in getTrainloader method.
-    val_dataloader_ar = dm_qa.getTrainloader(grouped_ds_ar, B=B)
-    val_dataloader_dit = dm_qa.getTrainloader(grouped_ds_dit, B=B)
-
-    
-    print("✅ DataLoader ready! First batch shape:", next(iter(val_dataloader_ar))['input_ids'].shape)
-
-    # ---------------------------------------------------------
-    # 7. Execution (Uncomment and modify when ready to run)
-    # ---------------------------------------------------------
-    device = getDevice()
-
-    # Extract architecture dimensions from OmegaConf config
-    C = config.backbone.C
-    H = config.backbone.H  
-    N = config.backbone.N
-    lr = config.training.learning_rate
-    wup_steps = config.training.warmup_steps
-    vocab_size = len(tokenizer)
-    ar_model_ckpt = "checkpoints/AR-epoch=07-val_loss=1.3041.ckpt/AR-epoch=07-val_loss=1.3041.ckpt"
-    ddm_model_unif_ckpt = "checkpoints/DiT-independent-epoch=09-val_loss=1.7500.ckpt/DiT-independent-epoch=09-val_loss=1.7500.ckpt"
-    ddm_model_sigm_ckpt = "checkpoints/DiT-moving_sigmoid-epoch=07-val_loss=1.8796.ckpt/DiT-moving_sigmoid-epoch=07-val_loss=1.8796.ckpt"
-    ddm_model_posdip_ckpt = "checkpoints/DiT-position-epoch=06-val_loss=1.6808.ckpt/DiT-position-epoch=06-val_loss=1.6808.ckpt"
-
-
-    print("Starting benchmark for model")
-    model_to_test = input("Enter model to test ('ar' or 'ddm'): ").strip().lower()
-    
-    if model_to_test=="ar":
-        print("Loading AR model...")
-        # Initialize Autoregressive backbone and load Lightning checkpoint
-        backbone_ar = AR(V=vocab_size, C=C, H=H, N=N)
-        model_ar = GPT.load_from_checkpoint(ar_model_ckpt,
-                                            backbone=backbone_ar,
-                                            tokenizer=tokenizer,
-                                            T=T,
-                                            learning_rate=lr,
-                                            warmup_steps=wup_steps,
-                                            strict=False).to(device)
-
-        ppx = Perplexity(model=model_ar.backbone, 
-                        model_type='ar', 
-                        mask_token_id=tokenizer.mask_token_id, 
-                        vocab_size=vocab_size)
-        ppx_value = ppx.calculate(val_dataloader_ar)
-
-    elif model_to_test=="ddm":
-        print("Loading DDM model...")
-        # Initialize DiT/DDM backbone and load Lightning checkpoint
-        backbone_ddm = DiT(V=vocab_size, C=C, H=H, N=N)
-        model_ddm = Diffusion.load_from_checkpoint(ddm_model_unif_ckpt,
-                                            backbone=backbone_ddm,
-                                            tokenizer=tokenizer,
-                                            T_ctx=T_context,
-                                            T_ans=T_answer,
-                                            learning_rate=lr,
-                                            warmup_steps=wup_steps,
-                                            strict=False).to(device)
-        
-        ppx = Perplexity(model=model_ddm, 
-                        model_type='ddm', 
-                        mask_token_id=tokenizer.mask_token_id, 
-                        vocab_size=vocab_size)
-        ppx_value = ppx.calculate(val_dataloader_dit)
-    
-    
-    #
-    # orchestrator = BenchmarkOrchestrator(
-    #     model_ar=model_ar, 
-    #     model_ddm=model_ddm, 
-    #     dataloader=val_dataloader
-    # )
-    # 
-    # Generate texts
-    # orchestrator.generate_and_save_dataset(filename="smoltalk_eval.json", max_samples=100)
-    # 
-    # Run evaluations
-    # results = orchestrator.run_all_benchmarks(dataset_filename="smoltalk_eval.json")
-    # orchestrator.generate_plots(metrics_filename="final_metrics.json")
