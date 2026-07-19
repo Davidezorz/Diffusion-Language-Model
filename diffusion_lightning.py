@@ -9,11 +9,6 @@ import torch.nn.functional as F
 import torchmetrics
 import transformers
 
-import models
-import noise.noise_schedule as noise_schedule
-import utils
-
-# import models.masking_schedule as masking_schedule
 import models.noise_schedule as noise_schedule
 import noise.masking_schedule as masking_schedule
 
@@ -25,6 +20,7 @@ LOG2 = math.log(2)
 ╭ CONVENTIONS ───────────────────────────────────────────────────────────────────╮
 │ ├─• B        ▶ batch size                                                      │
 │ ├─• T        ▶ number of tokens in a batch i.e. length of a sequence/sentence  │
+│ ├─• T_ans    ▶ number of tokens for the diffusion block (answer section)       │
 │ ├─• C        ▶ embedding dimension of each token                               │
 │ │                                                                              │
 │ ╰─• V        ▶ vocabulary size                                                 │
@@ -195,11 +191,13 @@ class Diffusion(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         attention_mask = batch.get("attention_mask")
+        ans_start_idx = batch.get('ans_start_idx', None)
 
         losses = self._loss(
-            batch["input_ids"],
-            batch["output_ids"],
-            attention_mask,
+            input_ids     =batch["input_ids"],
+            output_ids    =batch["output_ids"],
+            attention_mask=attention_mask,
+            ans_start_idx =ans_start_idx
         )
 
         self.valid_metrics.update(
@@ -323,7 +321,7 @@ class Diffusion(L.LightningModule):
 
 
     def _scatter_to_answer(self, values, ans_start_idx, T, fill_value=0):
-        """Scatter a B x T_ans tensor into a B x T tensor at the answer positions."""
+        """Scatter a B x T_ans tensor into a B x T tensor at answer positions."""
         B = values.shape[0]
 
         out = torch.full((B, T), fill_value,                                     # Full mask initialized to `fill_value`
