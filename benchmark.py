@@ -12,6 +12,7 @@ from omegaconf import OmegaConf
 
 from utils.utils import getDevice
 from data_processing.data_manager import DataManagerQA
+import models.masking_schedule as masking_schedule
 
 from models.AR import AR
 from models.DiT import DiT
@@ -71,56 +72,74 @@ class Perplexity:
     # 2. Function for Diffusion Model
     # ==========================================
     def _evaluate_ddm_batch(self, input_ids, labels):
-        """
-        Compute the sum of the weighted Loss (ELBO) for a batch in the Diffusion Model.
-        Do we use a linear schedule just for start.  
-        """
         batch_size, seq_len = input_ids.shape
         
         with torch.no_grad():
-            # Let sample a casual 't' time from 0 to 1 for EVERY sentence in the batch 
-            t = torch.rand(batch_size, 1, device=self.device)
-            # For a linear schedule, the percentage  of masked tocken is simply t
-            # (In a more complex schedules, mask_ratio = compute_schedule(t))
-            mask_ratio = t 
-            # For the linear schedule, the mathematical derived value that works as the ELBO weight is constant (1.0)
-            # If in the future we would use a different schedule, this weight will be changed in function of t
-            weight_t = 1.0 
+            # 1. Sample a random 't' time from 0 to 1 for EVERY sentence in the batch
+            t = torch.rand(batch_size, device=self.device)
             
-            # Let's create a casual mask
+            # --- NEW DYNAMIC MASKING LOGIC (Standalone Functions) ---
+            if self.model.corruption_type == "independent":
+                move_chance, loss_weight = masking_schedule.vanilla_masking(
+                    t=t,
+                    T=seq_len,
+                    device=self.device,
+                    noise=self.model.noise
+                )
+            elif self.model.corruption_type == "position":
+                move_chance, loss_weight = masking_schedule.position_dependent_masking(
+                    t=t,
+                    T=seq_len,
+                    device=self.device,
+                    noise=self.model.noise,
+                    gamma=self.model.position_gamma,
+                    position_loss_weighting=self.model.position_loss_weighting
+                )
+            elif self.model.corruption_type == "moving_sigmoid":
+                move_chance, loss_weight = masking_schedule.moving_sigmoid_masking(
+                    t=t,
+                    T=seq_len,
+                    device=self.device,
+                    noise=self.model.noise,
+                    k=self.model.sigmoid_k,
+                    calibrated=self.model.calibrated_sigmoid
+                )
+            else:
+                raise ValueError(f"Unknown corruption type: {self.model.corruption_type}")
+            # ---------------------------------
+            
+            # 2. Create the mask
             rand_matrix = torch.rand(batch_size, seq_len, device=self.device)
-            
-            # Let's mask ONLY the token of the answer (labels != -100) 
-            # with a probability of mask_ratio
             is_response_token = (labels != -100)
-            mask_bool = is_response_token & (rand_matrix < mask_ratio)
             
-            # We apply the mask to the input
+            # move_chance adapts automatically based on the schedule shape
+            mask_bool = is_response_token & (rand_matrix < move_chance)
+            
             masked_input_ids = input_ids.clone()
             masked_input_ids[mask_bool] = self.mask_token_id
             
-            # We create the labels for the Loss: let we isolate ONLY the maskered token
             ddm_labels = labels.clone()
             ddm_labels[~mask_bool] = -100 
             
-            # Forward Pass
-            logits = self.model(masked_input_ids)
+            # 3. Forward Pass (Providing the required sigma)
+            sigma, _ = self.model.noise(t)
+            logits = self.model(masked_input_ids, sigma=sigma)
             
-            # Compute the Loss NOT reducted, to be able to apply the weight for the sentence
+            # 4. Compute the unreduced Loss
             loss_per_token = F.cross_entropy(
                 logits.view(-1, self.vocab_size), 
                 ddm_labels.view(-1), 
                 ignore_index=-100, 
-                reduction='none' # Mantain the unroll tensor
+                reduction='none' 
             )
             
-            # Reroll the tensor to (batch_size, seq_len) and sum the loss for every sentences
-            loss_per_seq = loss_per_token.view(batch_size, seq_len).sum(dim=1)
-            # Multiply for the ELBO weight of the 't' step of that specific sentence
-            weighted_loss_per_seq = loss_per_seq * weight_t
-            # Sum all to obtain the total loss of the batch
+            # 5. Apply the ELBO Math
+            loss_per_seq = loss_per_token.view(batch_size, seq_len)
+            
+            # Multiply by the dynamically calculated loss_weight
+            weighted_loss_per_seq = loss_per_seq * loss_weight
+            
             batch_total_loss = weighted_loss_per_seq.sum().item()
-            # Count how many token has been ACTUALLY masked and valuated in this batch
             valid_masked_tokens = (ddm_labels != -100).sum().item()
             
         return batch_total_loss, valid_masked_tokens
@@ -986,7 +1005,7 @@ class BenchmarkOrchestrator:
 def load_smoltal_test():
     ds = datasets.load_dataset("HuggingFaceTB/smoltalk",
                                "all",
-                               split="test",                          
+                               split="test[:10%]",                          
                                cache_dir=".data"
                               )
     print(ds.cache_files)
@@ -1089,11 +1108,11 @@ if __name__ == '__main__':
                                             warmup_steps=wup_steps,
                                             strict=False).to(device)
         
-        ppx = Perplexity(model=model_ddm.backbone, 
+        ppx = Perplexity(model=model_ddm, 
                         model_type='ddm', 
                         mask_token_id=tokenizer.mask_token_id, 
                         vocab_size=vocab_size)
-        ppx_value = ppx.calculate(val_dataloader_ddm)
+        ppx_value = ppx.calculate(val_dataloader_dit)
     
     
     #
