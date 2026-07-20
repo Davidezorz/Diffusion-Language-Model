@@ -1,19 +1,24 @@
 import lightning as L
+import torch
 import datasets
+
 from omegaconf import OmegaConf
 
-import models.noise_schedule as noise_schedule
 from data_processing.data_manager import DataManagerQA
 import utils.utils
 from models.AR import AR
 from models.BERT import BERT
-from GPT_Lightning import GPT
 from models.DiT import DiT
+
+from GPT_Lightning import GPT
 from diffusion_lightning import Diffusion
+
+import noise.noise_schedule as noise_schedule
+import noise.masking_schedule as masking_schedule
+
 import data_processing.samplers as samplers
 from utils.transfer_weights import *
-import test
-import torch
+import tests.test as test
 
 from transformers import (
     AutoModelForCausalLM,
@@ -159,7 +164,8 @@ def count_pad(process_tokens,
 # │                                   Main                                    │
 # ╰───────────────────────────────────────────────────────────────────────────╯
 
-def main():
+def main(): 
+    print('Main online\n')
     """
     Main training and evaluation pipeline.
 
@@ -175,13 +181,15 @@ def main():
     8. Run qualitative generation examples
     """
     torch.set_float32_matmul_precision("high") # for CUDA
-    print('Main online\n')
 
     # -------------------------------------------------------------------------
     # Configuration and runtime setup
     # -------------------------------------------------------------------------
-    config = OmegaConf.load("config.yaml")    # get the config
+    config = OmegaConf.load("config.yaml")                                      # get the config
     mode = config.mode
+    if mode not in ['AR', 'DiT']:                                             # check if the mode is supported [AR or DiT]
+        raise ValueError("ERROR: supported modes are 'AR' and 'DiT', " + \
+                         f"but '{mode}' was found.")
 
     print(
         f"""
@@ -256,46 +264,31 @@ def main():
 
     tokenized = {}
 
-    for split_name, split in {
-        "train": train_dataset,
-        "validation": val_dataset,
-    }.items():
+    dict_names = {"train": train_dataset, "validation": val_dataset}
+    for split_name, split in dict_names.items():
         tokenized[split_name] = data_manager.tokenize(
             split,
             split_name=split_name,
         )
 
     train_tokens = tokenized["train"]
-    val_tokens = tokenized["validation"]
+    val_tokens   = tokenized["validation"]
 
-    if mode == "AR":
-        train_process_tokens = data_manager.group_texts_ar(
-            train_tokens,
-            config.backbone.T,
+    train_process_tokens = data_manager.group_texts(
+            dataset = train_tokens,
+            T       = config.backbone.T,
+            T_ctx   = config.backbone.T_ctx,
+            T_ans   = config.backbone.T_ans,
             split_name="train",
         )
-
-        val_process_tokens = data_manager.group_texts_ar(
-            val_tokens,
-            config.backbone.T,
-            split_name="validation",
-        )
-
-    else:
-        train_process_tokens = data_manager.group_texts_dit(
-            dataset=train_tokens,
-            T_ctx=config.backbone.T_ctx,
-            T_ans=config.backbone.T_ans,
-            split_name="train",
-        )
-
-        val_process_tokens = data_manager.group_texts_dit(
+    
+    val_process_tokens = data_manager.group_texts(
             dataset = val_tokens,
-            T_ctx=config.backbone.T_ctx,
-            T_ans=config.backbone.T_ans,
-            split_name="validation",
+            T       = config.backbone.T,
+            T_ctx   = config.backbone.T_ctx,
+            T_ans   = config.backbone.T_ans,
+            split_name="train",
         )
-
 
     # -------------------------------------------------------------------------
     # Optional dataset subsets for debugging
@@ -371,9 +364,10 @@ def main():
     )
 
     test.test_train_loader(train_loader)
+    # test.print_example_train_loader(train_loader, tokenizer)
 
     # -------------------------------------------------------------------------
-    # Defining backbone and loading weights
+    # Defining backbone (the actual NN)
     # -------------------------------------------------------------------------
 
     backbone = BACKBONES[mode](
@@ -392,11 +386,37 @@ def main():
     # test.test_model(backbone, tokenizer, mode)
     
     # -------------------------------------------------------------------------
+    # Defining lightning model and loading weights
+    # -------------------------------------------------------------------------
         
     print(f"\n{mode} parameters: {utils.utils.numberOfparameters(backbone)}")
 
-    if config.checkpoint is None:
-        hf_model = load_fn[mode]()
+    model_kwargs = {'backbone':      backbone,
+                    'tokenizer':     data_manager.tokenizer,
+                    'learning_rate': config.training.learning_rate,
+                    'warmup_steps':  config.training.warmup_steps,
+                    }
+
+    if mode in ["BERT", "DiT"]:                                                 # Diffusion-specific configuration
+        noise_name = config.diffusion.get("noise_schedule", "loglinear")        # for now wel is supported onlt loglinear
+        noise = noise_schedule.get_noise(noise_name)
+
+        corruption_type = config.diffusion.get("corruption_type","independent") # independent | position | moving_sigmoid
+        pos_weighting = config.diffusion.get("position_loss_weighting", False)
+        masking = masking_schedule.Masking(                                     # define the masking strategy
+            T_ans                  =config.backbone.T_ans,
+            noise                  =noise,
+            corruption_type        =corruption_type,
+            position_loss_weighting=pos_weighting,
+            gamma                  =config.diffusion.get("position_gamma", None),
+            k                      =config.diffusion.get("sigmoid_k", None)
+        )
+
+        model_kwargs.update({'masking_schedule': masking,
+                             'T_ans':            config.backbone.T_ans})
+
+    if not config.checkpoint:
+        hf_model = load_fn[mode]()                                              # load the hugging face model weights
 
         trasfer_weights(
             backbone,
@@ -406,39 +426,13 @@ def main():
             show_layers=False,
         )
 
-        model = MODELS[mode](
-            backbone,
-            data_manager.tokenizer,
-            T=config.backbone.T,
-            learning_rate=config.training.learning_rate,
-            warmup_steps=config.training.warmup_steps,
-        ).to(device)
-
+        model = MODELS[mode](**model_kwargs).to(device)
     else:
         model = MODELS[mode].load_from_checkpoint(
             config.checkpoint,
-            backbone=backbone,
-            tokenizer=data_manager.tokenizer,
-            T=config.backbone.T,
-            learning_rate=config.training.learning_rate,
-            warmup_steps=config.training.warmup_steps,
+            strict=False,
+            **model_kwargs
         ).to(device)
-
-    # -------------------------------------------------------------------------
-    # Diffusion-specific configuration
-    # -------------------------------------------------------------------------
-
-    if mode in ["BERT", "DiT"]:
-        noise_name = config.diffusion.get("noise_schedule", "loglinear")
-        if noise_name == "loglinear":
-            model.noise = noise_schedule.LogLinearNoise()
-        else:
-            raise ValueError(f"Unknown noise schedule: {noise_name}")
-        model.corruption_type = config.diffusion.get("corruption_type", "independent")
-        model.position_gamma = config.diffusion.get("position_gamma", 2.0)
-        model.position_loss_weighting = config.diffusion.get("position_loss_weighting", False)
-        model.sigmoid_k = config.diffusion.get("sigmoid_k", 10.0)
-        model.calibrated_sigmoid = config.diffusion.get("calibrated_sigmoid", False)
 
     # -------------------------------------------------------------------------
     # Checkpoint configuration
@@ -483,20 +477,20 @@ def main():
         print("\ntraining:")
 
         trainer = L.Trainer(
-            max_epochs=config.training.max_epochs,
-            accelerator=device,
-            devices=1,
-            enable_progress_bar=True,
-            limit_train_batches=config.training.limit_train_batches,
-            log_every_n_steps=config.training.log_every_n_steps,
-            accumulate_grad_batches=config.training.accumulate_grad_batches,
-            callbacks=[checkpoint_callback],
-            limit_val_batches=config.training.get(
-                "limit_val_batches",
-                1.0,
-            ),
-            gradient_clip_val=1.0,
-            gradient_clip_algorithm="norm",
+            max_epochs              =config.training.max_epochs,
+            accelerator             =device,
+            devices                 =1,
+            enable_progress_bar     =True,
+            limit_train_batches     =config.training.limit_train_batches,
+            log_every_n_steps       =config.training.log_every_n_steps,
+            accumulate_grad_batches =config.training.accumulate_grad_batches,
+            callbacks               =[checkpoint_callback],
+            limit_val_batches       =config.training.get(
+                                        "limit_val_batches",
+                                        1.0,
+                                    ),
+            gradient_clip_val       =1.0,
+            gradient_clip_algorithm ="norm",
         )
 
         model.train()
@@ -554,9 +548,9 @@ def main():
 
         else:  # DiT 
             generated = model.generate(
-                inputs,
-                n_tokens=256,
-                num_steps=100,
+                ids=inputs,
+                ans_start_idx=None,                                             # It will assume that all input is a question
+                num_steps=10,
                 temperature=0.8,
             )
 

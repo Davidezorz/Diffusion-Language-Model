@@ -218,8 +218,11 @@ class DiT(BaseModel):
         self.output    = DiTLastBlock(C, V, cond_dim)
         self.output.linear.weight = self.embedding.embedding                    # Weight Tying
 
+        self.last_hidden = None
+        self.logits      = None
 
-    def last_hidden(self, indices, sigma=None, seqlens=None):
+
+    def compute_last_hidden(self, indices, sigma=None, seqlens=None):
         if sigma is None: 
             sigma = torch.zeros(indices.shape[0]) # TODO: remove it
         conditioning = F.silu(self.sigma_map(sigma))
@@ -238,12 +241,15 @@ class DiT(BaseModel):
 
 
     def forward(self, indices, sigma=None, seqlens=None):
-        if sigma is None: 
+        if sigma is None:                                                       # B
             sigma = torch.zeros(indices.shape[0]) # TODO: remove it
 
-        x, conditioning = self.last_hidden(indices, sigma, seqlens)
-        logits = self.output(x, conditioning)          
-        return logits
+        last_hidden, conditioning = self.compute_last_hidden(indices, 
+                                                             sigma, seqlens)
+        self.last_hidden = last_hidden                                          # store last hidden
+
+        self.logits = self.output(last_hidden, conditioning)          
+        return self.logits
     
 
     @torch.no_grad()

@@ -13,8 +13,7 @@ from transformers import AutoModelForCausalLM
 
 class  GPT(L.LightningModule):
 
-    def __init__(self, backbone, tokenizer, T=None,
-                gen_ppl_model_id='gpt2', learning_rate=5e-5,
+    def __init__(self, backbone, tokenizer, learning_rate=5e-5,
                 warmup_steps=1000,):
         
         super().__init__()
@@ -29,17 +28,6 @@ class  GPT(L.LightningModule):
         self.backbone = backbone
         self.learning_rate = learning_rate
         self.warmup_steps=warmup_steps
-        """
-        # For Generative PPL (External Model)
-        self.eval_tokenizer = AutoTokenizer.from_pretrained(gen_ppl_model_id)
-        self.eval_model = AutoModelForCausalLM.from_pretrained(gen_ppl_model_id)
-        if self.eval_tokenizer.pad_token is None:
-            self.eval_tokenizer.pad_token = self.eval_tokenizer.eos_token
-
-        self.eval_model.eval()
-        for p in self.eval_model.parameters():
-            p.requires_grad = False
-        """
 
 
     def configure_optimizers(self):
@@ -198,16 +186,6 @@ class  GPT(L.LightningModule):
         )
 
         return loss
-
-
-    def on_validation_epoch_end(self):
-        return
-        x = torch.full((4, 1), self.tokenizer.bos_token_id, device=self.device)
-        samples = self.generate(x, n_tokens=50)
-        decoded_samples = self.tokenizer.batch_decode(samples, skip_special_tokens=True)
-   
-        gen_ppl = self.compute_generative_perplexity(decoded_samples)
-        self.log('val/gen_ppl', gen_ppl, sync_dist=True)
 
 
     @torch.no_grad()

@@ -290,8 +290,8 @@ class DataManagerQA(DataManagerPreTrain):
                     target_a = target_a[:T_ans]                                 # Slicing answer to fit maximum allowed window
                     
                 ctx_ids = []
-                if len(target_q) >= T_ctx - 1:
-                    ctx_ids = target_q[-(T_ctx - 1):]                           # Question is massive, take only the end
+                if len(target_q) >= T_ctx - 1:                                  # TODO: we should add "User :" at the beginning
+                    ctx_ids = target_q[-(T_ctx - 1):]                           # Question is massive, take only the end 
                 else:
                     ctx_ids = target_q
                     hist_idx = target_idx - 1
@@ -321,10 +321,10 @@ class DataManagerQA(DataManagerPreTrain):
                 ans_start_idxs.append(len(ctx_ids))                             # Pass the exact boundary index!
 
         return {
-            'input_ids':  in_blocks, 
-            'output_ids': label_blocks, 
+            'input_ids':      in_blocks, 
+            'output_ids':     label_blocks, 
             'attention_mask': attn_masks, 
-            'ans_start_idx': ans_start_idxs
+            'ans_start_idx':  ans_start_idxs
         }
 
 

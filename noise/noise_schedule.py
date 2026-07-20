@@ -10,22 +10,24 @@ torch._C._jit_override_can_fuse_on_cpu(True)
 torch._C._jit_override_can_fuse_on_gpu(True)
 
 
-def get_noise(config, dtype=torch.float32):
-    if config.noise.type == 'geometric':
+def get_noise(noise_type, dtype=torch.float32):
+    if noise_type == 'geometric':
+        raise NotImplementedError(f"{noise_type} not supported")
         return GeometricNoise(config.noise.sigma_min,
                               config.noise.sigma_max)
-    elif config.noise.type == 'loglinear':
+    elif noise_type == 'loglinear':
         return LogLinearNoise()
-    elif config.noise.type == 'cosine':
+    elif noise_type == 'cosine':
         return CosineNoise()
-    elif config.noise.type == 'cosinesqr':
+    elif noise_type == 'cosinesqr':
         return CosineSqrNoise()
-    elif config.noise.type == 'linear':
-        return Linear(config.noise.sigma_min,
-                      config.noise.sigma_max,
+    elif noise_type == 'linear':
+        raise NotImplementedError(f"{noise_type} not supported")
+        return Linear(noise_sigma_min,
+                      noise_sigma_max,
                       dtype)
     else:
-        raise ValueError(f'{config.noise.type} is not a valid noise')
+        raise ValueError(f'{noise_type} is not a valid noise')
 
 
 def binary_discretization(z):
