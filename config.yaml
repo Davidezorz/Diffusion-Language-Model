@@ -9,8 +9,8 @@ inference_only:     False           # true | false
 backbone:
     B: 2                            # ◀ batch dimension
     T: 768                          # ◀ context window AR (max sequence length)
-    T_ctx: 256                      # ◀ context window   Diffusion 
-    T_ans: 128                      # ◀ denoising window Diffusion 
+    T_ctx: 768                      # ◀ context window   Diffusion 
+    T_ans: 256                      # ◀ denoising window Diffusion 
     C: 768                          # ◀ embedding dimension
     N: 22                           # ◀ number of blocks
     H: 12                           # ◀ number of heads
@@ -39,7 +39,7 @@ diffusion:
     position_gamma: 0.2
     position_loss_weighting: false
 
-    sigmoid_k: 5
+    sigmoid_k: 15
     calibrated_sigmoid: true
     
 

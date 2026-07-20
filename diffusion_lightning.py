@@ -290,7 +290,6 @@ class Diffusion(L.LightningModule):
             sigma[:, None],
             seqlens=seqlens,
         )
-
         safe_output_ids = output_ids.clone()
         safe_output_ids[safe_output_ids == self.IGNORE_IDX] = 0
 
