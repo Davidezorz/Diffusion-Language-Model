@@ -397,7 +397,6 @@ def main():
                     'warmup_steps':  config.training.warmup_steps,
                     }
 
-
     if mode in ["BERT", "DiT"]:                                                 # Diffusion-specific configuration
         noise_name = config.diffusion.get("noise_schedule", "loglinear")        # for now wel is supported onlt loglinear
         noise = noise_schedule.get_noise(noise_name)
