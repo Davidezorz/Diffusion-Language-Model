@@ -405,7 +405,7 @@ def main():
         corruption_type = config.diffusion.get("corruption_type","independent") # independent | position | moving_sigmoid
         pos_weighting = config.diffusion.get("position_loss_weighting", False)
         masking = masking_schedule.Masking(                                     # define the masking strategy
-            T                      =config.backbone.T_ans,
+            T_ans                  =config.backbone.T_ans,
             noise                  =noise,
             corruption_type        =corruption_type,
             position_loss_weighting=pos_weighting,
@@ -431,6 +431,7 @@ def main():
     else:
         model = MODELS[mode].load_from_checkpoint(
             config.checkpoint,
+            strict=False,
             **model_kwargs
         ).to(device)
 
@@ -548,9 +549,9 @@ def main():
 
         else:  # DiT 
             generated = model.generate(
-                inputs,
-                n_tokens=256,
-                num_steps=100,
+                ids=inputs,
+                ans_start_idx=None,                                             # It will assume that all input is a question
+                num_steps=10,
                 temperature=0.8,
             )
 

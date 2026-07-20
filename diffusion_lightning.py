@@ -26,8 +26,14 @@ LOG2 = math.log(2)
 │ ╰─• V        ▶ vocabulary size                                                 │
 ╰────────────────────────────────────────────────────────────────────────────────╯
 """
-
-
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForMaskedLM,
+    AutoTokenizer,
+)
+tokenizer = AutoTokenizer.from_pretrained(
+        "jhu-clsp/ettin-decoder-150m",
+    )
 
 # ╭──────────────────────────────────────────────────────────────────────────────╮
 # │                                     Loss                                     │
@@ -421,10 +427,11 @@ class Diffusion(L.LightningModule):
     def generate(
         self,
         ids,
-        n_tokens=100,
+        ans_start_idx=None,
         num_steps=100,
         eps=1e-5,
         temperature=1.0,
+        test=None
     ):
         """
         Generate a response conditioned on a prompt using reverse diffusion.
@@ -449,66 +456,66 @@ class Diffusion(L.LightningModule):
             tensor of shape (B, T_prompt + n_tokens) containing the prompt
             followed by the generated answer.
         """
-
         B, T_prompt = ids.shape
         device = ids.device
+        
+        T = T_prompt + self.T_ans
+        
+        if ans_start_idx is None:
+            ans_start_idx = torch.full((B,), T_prompt, 
+                                       dtype=torch.long, device=device)
 
-        # build sequence: [prompt] + [MASK] * n_tokens
-        answer = torch.full(
-            (B, n_tokens),
-            fill_value=self.mask_index,
-            dtype=torch.long,
-            device=device,
-        )
-
-        x = torch.cat([ids, answer], dim=-1)
-
-        # only answer positions are allowed to change!!
-        gen_mask = torch.zeros_like(x, dtype=torch.bool)
-        gen_mask[:, T_prompt:] = True
+        # 1. Base initialization: Fill with PAD and copy the prompt.
+        pad_id = self.tokenizer.pad_token_id
+        x = torch.full((B, T), pad_id, dtype=torch.long, device=device)
+        x[:, :T_prompt] = ids
+        
+        # 2. Build the boolean mask for the answer positions using the scatter function.
+        # This handles shifting the answer block past the variable context length.
+        true_block = torch.ones((B, self.T_ans), dtype=torch.bool, device=device)
+        gen_mask = self._scatter_to_answer(true_block, ans_start_idx, 
+                                           T, fill_value=0)
+        
+        # 3. Inject [MASK] tokens exactly into the targeted answer block.
+        x = torch.where(gen_mask, self.mask_index, x)
 
         timesteps = torch.linspace(1, eps, num_steps + 1, device=device)
         dt = (1 - eps) / num_steps
 
         for i in range(num_steps):
-            t = timesteps[i] * torch.ones(B, 1, device=device)
-            x_s = self._ddpm_update_conditional(
-                x_t=x,
-                t=t,
-                dt=dt,
-                gen_mask=gen_mask,
-                temperature=temperature,
+            t = timesteps[i] * torch.ones(B, device=device)
+
+            x = self._ddpm_update_conditional(                                  # we run the denoising step by 
+                x_t          =x,                                                # keeping the prompt frozen
+                t            =t,
+                dt           =dt,
+                gen_mask     =gen_mask,
+                ans_start_idx=ans_start_idx,
+                temperature  =temperature,
             )
 
-            # we keep prompt frozen
-            x = self._ddpm_update_conditional(
-                x_t=x,
-                t=t,
-                dt=dt,
-                gen_mask=gen_mask,
-                temperature=temperature,
+            if test is not None:
+                last_hidden = self.backbone.last_hidden
+                logits      = self.backbone.logits
+                test()
+            """
+            res = tokenizer.decode(
+                x[0],
+                skip_special_tokens=False,
             )
+            print(res, end='\n----\n')"""
 
-        # final denoise step only on answer positions
-        t = timesteps[-1] * torch.ones(B, 1, device=device)
+        t = timesteps[-1] * torch.ones(B, device=device)                     # final denoise step only on answer positions
         sigma, _ = self.noise(t)
 
-        seqlens = torch.full(
-            (B,),
-            x.shape[1],
-            dtype=torch.long,
-            device=device,
-        )
+        seqlens = ans_start_idx + self.T_ans
+        final_logits = self.forward(x, sigma, seqlens) / temperature
 
-        final_logits = self.forward(x, sigma, seqlens=seqlens)
-
-        if temperature != 1.0:
-            final_logits = final_logits / temperature
-
-        final_tokens = final_logits.argmax(dim=-1)
+        final_tokens = final_logits.argmax(dim=-1)                              # last stpe unmask everything
         x = torch.where(gen_mask, final_tokens, x)
 
         return x
+
 
     def _ddpm_update_conditional(
             self,
@@ -516,6 +523,7 @@ class Diffusion(L.LightningModule):
             t,
             dt,
             gen_mask,
+            ans_start_idx,
             temperature=1.0,
     ):
         """
@@ -552,8 +560,7 @@ class Diffusion(L.LightningModule):
             x_s:
                 Sequence sampled at the earlier diffusion time s.
         """
-        B = x_t.shape[0]
-        device = x_t.device
+        B, T = x_t.shape
 
         # ------------------------------------------------------------------
         # 1. Define the two diffusion times: current t and earlier s < t
@@ -561,33 +568,26 @@ class Diffusion(L.LightningModule):
         s = t - dt
 
         sigma_t, _ = self.noise(t)
-        sigma_s, _ = self.noise(s)
-        sigma_t = sigma_t.squeeze(-1)
-        sigma_s = sigma_s.squeeze(-1)
-
         # ------------------------------------------------------------------
         # 2. Forward masking probabilities
         #    mu_t = P(x_t = MASK | x_0)
         #    mu_s = P(x_s = MASK | x_0)
         # ------------------------------------------------------------------
-
-        mu_t = 1 - torch.exp(-sigma_t)
-        mu_s = 1 - torch.exp(-sigma_s)
+        mu_t, _ = self.masking_schedule(t)
+        mu_s, _ = self.masking_schedule(s)
 
         # Reshape for broadcasting over sequence positions and vocabulary
-        mu_t = mu_t[:, None, None]
-        mu_s = mu_s[:, None, None]
+        mu_t = self._scatter_to_answer(mu_t, ans_start_idx, T, fill_value=0.0)
+        mu_s = self._scatter_to_answer(mu_s, ans_start_idx, T, fill_value=0.0)
+
+        # Reshape for broadcasting over vocabulary: [B, T, 1]
+        mu_t = mu_t[:, :, None]
+        mu_s = mu_s[:, :, None]
 
         # ------------------------------------------------------------------
         # 3. Predict the clean-token distribution -> log_p_x0 = log p_theta(x_0 | x_t, t)
         # ------------------------------------------------------------------
-
-        seqlens = torch.full(
-            (B,),
-            x_t.shape[1],
-            dtype=torch.long,
-            device=device,
-        )
+        seqlens = ans_start_idx + self.T_ans
 
         log_p_x0 = self.forward(
             x_t,
@@ -603,7 +603,6 @@ class Diffusion(L.LightningModule):
         # ------------------------------------------------------------------
         # 4. Construct the reverse categorical distribution
         # ------------------------------------------------------------------
-
         reveal_mass = mu_t - mu_s
         remain_masked_mass = mu_s
 
@@ -616,7 +615,6 @@ class Diffusion(L.LightningModule):
         # ------------------------------------------------------------------
         # 5. Sample x_s from the reverse categorical weights
         # ------------------------------------------------------------------
-
         sampled_x_s = _sample_categorical(
             reverse_weights,
             reverse_weights.device,
@@ -627,7 +625,6 @@ class Diffusion(L.LightningModule):
         #    - if x_t is already visible, then x_s = x_t.
         #    - only currently masked positions may change.
         # ------------------------------------------------------------------
-
         currently_masked = x_t == self.mask_index
 
         x_s = torch.where(
@@ -641,7 +638,6 @@ class Diffusion(L.LightningModule):
         #    - context positions remain fixed
         #    - only answer positions identified by gen_mask may evolve
         # ------------------------------------------------------------------
-
         x_s = torch.where(
             gen_mask,
             x_s,
@@ -652,8 +648,22 @@ class Diffusion(L.LightningModule):
 
 
 def _sample_categorical(categorical_probs, device):
-  gumbel_norm = ( 1e-10 - (torch.rand_like(categorical_probs, device=device) 
-                           + 1e-10).log())
-  return (categorical_probs / gumbel_norm).argmax(dim=-1)
+    gumbel_norm = ( 1e-10 - (torch.rand_like(categorical_probs, device=device) 
+                  + 1e-10).log())
+    return (categorical_probs / gumbel_norm).argmax(dim=-1)
+
+
+"""
+[T_1, T_2, T_3, PAD, PAD]
+[T_1, T_2, T_3, T_4, T_5]
+
+[T_1, T_2, T_3, PAD, PAD] <- [DIFFUSION_BLOCK]
+[T_1, T_2, T_3, T_4, T_5] <- [DIFFUSION_BLOCK]
+
+[T_1, T_2, T_3, [DIFFUSION_BLOCK], PAD, PAD]
+[T_1, T_2, T_3, T_4, T_5, [DIFFUSION_BLOCK]]
+
+QAQ A
+"""
 
 

@@ -58,7 +58,7 @@ def test_dit_corruption():
     # -------------------------------------------------------------------------
     noise = noise_schedule.get_noise("loglinear")
     masking = masking_schedule.Masking(
-        T=T_ans,
+        T_ans=T_ans,
         noise=noise,
         corruption_type="moving_sigmoid",
         position_loss_weighting=False,
