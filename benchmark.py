@@ -13,7 +13,8 @@ from omegaconf import OmegaConf
 
 from utils.utils import getDevice
 from data_processing.data_manager import DataManagerQA
-import models.masking_schedule as masking_schedule
+import noise.masking_schedule as masking_schedule
+import noise.noise_schedule as noise_schedule
 
 from models.AR import AR
 from models.DiT import DiT
@@ -47,21 +48,7 @@ class Perplexity:
         batch_size, seq_len = input_ids.shape
         with torch.no_grad():
             t = torch.rand(batch_size, device=self.device)
-            
-            if self.model.corruption_type == "independent":
-                move_chance, loss_weight = masking_schedule.vanilla_masking(t=t, T=seq_len, device=self.device, noise=self.model.noise)
-            elif self.model.corruption_type == "position":
-                move_chance, loss_weight = masking_schedule.position_dependent_masking(
-                    t=t, T=seq_len, device=self.device, noise=self.model.noise,
-                    gamma=self.model.position_gamma, position_loss_weighting=self.model.position_loss_weighting
-                )
-            elif self.model.corruption_type == "moving_sigmoid":
-                move_chance, loss_weight = masking_schedule.moving_sigmoid_masking(
-                    t=t, T=seq_len, device=self.device, noise=self.model.noise,
-                    k=self.model.sigmoid_k, calibrated=self.model.calibrated_sigmoid
-                )
-            else:
-                raise ValueError(f"Unknown corruption type: {self.model.corruption_type}")
+            move_chance, loss_weight = self.model.masking_schedule(t)
             
             rand_matrix = torch.rand(batch_size, seq_len, device=self.device)
             is_response_token = (labels != -100)
@@ -460,8 +447,8 @@ class BenchmarkManager:
         self.ar_model_ckpt = "checkpoints/AR-epoch=07-val_loss=1.3041.ckpt/AR-epoch=07-val_loss=1.3041.ckpt"
         self.ddm_model_unif_ckpt = "checkpoints/DiT-independent-epoch=09-val_loss=1.7500.ckpt/DiT-independent-epoch=09-val_loss=1.7500.ckpt"
         self.ddm_model_sigm_ckpt = "checkpoints/DiT-moving_sigmoid-epoch=07-val_loss=1.8796.ckpt/DiT-moving_sigmoid-epoch=07-val_loss=1.8796.ckpt"
-        self.ddm_model_posdip_ckpt = "checkpoints/DiT-position-epoch=06-val_loss=1.6808.ckpt/DiT-position-epoch=06-val_loss=1.6808.ckpt"
-
+        self.ddm_model_posdip_ckpt = "checkpoints/DiT-position-epoch=06-val_loss=1.6808.ckpt/DiT-position-epoch=06-val_loss=1.6808.ckpt"   
+    
     def load_smoltal_test(self):
         ds = datasets.load_dataset("HuggingFaceTB/smoltalk", "all", split="test[:10%]", cache_dir=".data")
         return ds
@@ -485,14 +472,44 @@ class BenchmarkManager:
     def _upload_models_ar(self):
         print("Loading AR model...")
         backbone_ar = AR(V=self.vocab_size, C=self.C, H=self.H, N=self.N)
-        model_ar = GPT.load_from_checkpoint(self.ar_model_ckpt, backbone=backbone_ar, tokenizer=self.tokenizer, T=self.T, learning_rate=self.lr, warmup_steps=self.wup_steps, strict=False).to(self.device)
+        model_ar = GPT.load_from_checkpoint(self.ar_model_ckpt, backbone=backbone_ar, tokenizer=self.tokenizer, learning_rate=self.lr, warmup_steps=self.wup_steps, strict=False).to(self.device)
         return model_ar
+    
 
     def _upload_models_ddm(self, model_variant="unif"):
         print("Loading DDM model...")
         model_ckpt_map = {"unif": self.ddm_model_unif_ckpt, "sigm": self.ddm_model_sigm_ckpt, "posdip": self.ddm_model_posdip_ckpt}
         backbone_ddm = DiT(V=self.vocab_size, C=self.C, H=self.H, N=self.N)
-        self.model_ddm = Diffusion.load_from_checkpoint(model_ckpt_map[model_variant], backbone=backbone_ddm, tokenizer=self.tokenizer, T_ctx=self.T_context, T_ans=self.T_answer, learning_rate=self.lr, warmup_steps=self.wup_steps, strict=False).to(self.device)
+    
+
+
+        noise_name = self.config.diffusion.get("noise_schedule", "loglinear")        # for now wel is supported onlt loglinear
+        noise = noise_schedule.get_noise(noise_name)
+
+        corruption_type = self.config.diffusion.get("corruption_type","independent") # independent | position | moving_sigmoid
+        pos_weighting   = self.config.diffusion.get("position_loss_weighting", False)
+        masking = masking_schedule.Masking(                                     # define the masking strategy
+            T_ans                  =self.T_answer,
+            noise                  =noise,
+            corruption_type        =corruption_type,
+            position_loss_weighting=pos_weighting,
+            gamma                  =self.config.diffusion.get("position_gamma", None),
+            k                      =self.config.diffusion.get("sigmoid_k", None)
+        )
+
+        model_kwargs = {'backbone':         backbone_ddm,
+                        'tokenizer':        self.tokenizer,
+                        'learning_rate':    self.lr,
+                        'warmup_steps':     self.wup_steps,
+                        'masking_schedule': masking,
+                        'T_ans':            self.T_answer}
+
+        self.model_ddm = Diffusion.load_from_checkpoint(
+                model_ckpt_map[model_variant],
+                strict=False,
+                **model_kwargs
+            ).to(self.device)
+
         return self.model_ddm
 
     def generate_token_answers(self, model_type="ar", model_variant="unif"):

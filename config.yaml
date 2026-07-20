@@ -4,7 +4,7 @@ checkpoint:         '.weights/DiT-independent-epoch=09-val_loss=1.7500.ckpt'
     # false 
     # '.weights/AR-epoch=07-val_loss=1.3041.ckpt'  # checkpoints/
     # '.weights/DiT-independent-epoch=09-val_loss=1.7500.ckpt'
-inference_only:     True           # true | false
+inference_only:     False           # true | false
 
 backbone:
     B: 2                            # ◀ batch dimension
