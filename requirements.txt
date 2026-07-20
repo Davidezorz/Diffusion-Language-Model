@@ -12,3 +12,12 @@ scikit-learn  == 1.7.2
 
 omegaconf     == 2.3.0
 huggingface-hub
+
+# ----------------------------------------------------------------------
+# benchmark.py only (BERTScore, Self-BLEU, Fréchet BERT, LLM-as-a-Judge)
+# ----------------------------------------------------------------------
+scipy         == 1.16.3
+tqdm          == 4.67.1
+nltk          # required for Self-BLEU; download 'punkt' via: python -m nltk.downloader punkt
+bert-score    # BERTScore micro-semantic metric
+openai        # LLM-as-a-Judge client (works with any OpenAI-compatible API)
