@@ -431,7 +431,7 @@ class Diffusion(L.LightningModule):
         num_steps=100,
         eps=1e-5,
         temperature=1.0,
-        test=None
+        evaluation_elements=None
     ):
         """
         Generate a response conditioned on a prompt using reverse diffusion.
@@ -484,6 +484,7 @@ class Diffusion(L.LightningModule):
 
         for i in range(num_steps):
             t = timesteps[i] * torch.ones(B, device=device)
+            x_prev = x
 
             x = self._ddpm_update_conditional(                                  # we run the denoising step by 
                 x_t          =x,                                                # keeping the prompt frozen
@@ -494,10 +495,12 @@ class Diffusion(L.LightningModule):
                 temperature  =temperature,
             )
 
-            if test is not None:
-                last_hidden = self.backbone.last_hidden
-                logits      = self.backbone.logits
-                test()
+            if evaluation_elements is not None:
+                evaluator, target_labels = evaluation_elements
+                last_hidden = self.backbone.last_hidden                         # B T C
+                logits      = self.backbone.logits                              # B T V
+                evaluator.update_step(i, logits, last_hidden, 
+                                      x_prev, target_labels)
             """
             res = tokenizer.decode(
                 x[0],
