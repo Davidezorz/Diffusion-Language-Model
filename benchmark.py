@@ -44,25 +44,33 @@ class Perplexity:
             valid_tokens = (shift_labels != -100).sum().item()
         return loss.item(), valid_tokens
     
-    def _evaluate_ddm_batch(self, input_ids, labels):
+    def _scatter_to_answer(self, values, ans_start_idx, T, T_ans, fill_value=0.0):
+        """A self-contained helper to scatter values into the answer block of a tensor."""
+        B = values.shape[0]
+        out = torch.full((B, T), fill_value, dtype=values.dtype, device=values.device)
+        positions = ans_start_idx[:, None] + torch.arange(T_ans, device=values.device, dtype=torch.long)[None, :]
+        rows = torch.arange(B, device=values.device)[:, None]
+        out[rows, positions] = values
+        return out
+
+    def _evaluate_ddm_batch(self, input_ids, labels, ans_start_idx):
         batch_size, seq_len = input_ids.shape
         with torch.no_grad():
             t = torch.rand(batch_size, device=self.device)
             move_chance, loss_weight = self.model.masking_schedule(t)
-            
-            if move_chance.dim() == 2 and move_chance.shape[1] != seq_len:
-                ans_len = move_chance.shape[1]
-                full_move_chance = torch.zeros(batch_size, seq_len, device=self.device)
-                full_move_chance[:, -ans_len:] = move_chance
-            else:
-                full_move_chance = move_chance
 
-            if loss_weight.dim() == 2 and loss_weight.shape[1] != seq_len:
-                ans_len = loss_weight.shape[1]
-                full_loss_weight = torch.zeros(batch_size, seq_len, device=self.device)
-                full_loss_weight[:, -ans_len:] = loss_weight
-            else:
-                full_loss_weight = loss_weight
+            # --- CORRECTED LOGIC ---
+            # Use a scatter operation to correctly align probabilities with the answer block.
+            T_ans = self.model.T_ans
+            full_move_chance = self._scatter_to_answer(move_chance, ans_start_idx, seq_len, T_ans, fill_value=0.0)
+
+            # Handle both (B, 1) and (B, T_ans) shapes for loss_weight
+            if loss_weight.dim() == 1 or loss_weight.shape[1] == 1:
+                expanded_weight = loss_weight.expand(-1, T_ans)
+                full_loss_weight = self._scatter_to_answer(expanded_weight, ans_start_idx, seq_len, T_ans, fill_value=1.0)
+            else: # Assumes shape is (B, T_ans)
+                full_loss_weight = self._scatter_to_answer(loss_weight, ans_start_idx, seq_len, T_ans, fill_value=1.0)
+            # --- END CORRECTION ---
 
             is_response_token = (labels != -100)
             rand_matrix = torch.rand(batch_size, seq_len, device=self.device)
@@ -71,14 +79,16 @@ class Perplexity:
             
             masked_input_ids = input_ids.clone()
             masked_input_ids[mask_bool] = self.mask_token_id
+            
             ddm_labels = labels.clone()
             ddm_labels[~mask_bool] = -100 
             
             sigma, _ = self.model.noise(t)
             logits = self.model(masked_input_ids, sigma=sigma)
             
-            loss_per_token = F.cross_entropy(logits.view(-1, self.vocab_size), ddm_labels.view(-1), ignore_index=-100, reduction='none')
-            
+            # CORRECTED: Use nll_loss because the model's forward pass already returns log-probabilities.
+            # Using cross_entropy would incorrectly apply log_softmax a second time.
+            loss_per_token = F.nll_loss(logits.view(-1, self.vocab_size), ddm_labels.view(-1), ignore_index=-100, reduction='none')
             raw_batch_loss = loss_per_token.sum().item()
             
             loss_per_seq = loss_per_token.view(batch_size, seq_len)
@@ -96,8 +106,8 @@ class Perplexity:
             ar_total_loss, ar_total_tokens = 0.0, 0
             for batch in tqdm(val_dataloader, desc="Processing AR Batches"):
                 input_ids, labels = batch['input_ids'].to(self.device), batch['labels'].to(self.device)
-                with torch.amp.autocast(device_type=self.device, dtype=torch.float16):
-                    ar_loss, ar_tokens = self._evaluate_ar_batch(input_ids, labels)
+
+                ar_loss, ar_tokens = self._evaluate_ar_batch(input_ids, labels)
                 ar_total_loss += ar_loss
                 ar_total_tokens += ar_tokens
             ar_mean_loss = ar_total_loss / max(ar_total_tokens, 1)
@@ -110,9 +120,12 @@ class Perplexity:
             ddm_total_tokens = 0
             
             for batch in tqdm(val_dataloader, desc="Processing DDM Batches"):
-                input_ids, labels = batch['input_ids'].to(self.device), batch['labels'].to(self.device)
-                with torch.amp.autocast(device_type=self.device, dtype=torch.float16):
-                    elbo_loss, raw_loss, ddm_tokens = self._evaluate_ddm_batch(input_ids, labels)
+                input_ids = batch['input_ids'].to(self.device)
+                labels = batch['labels'].to(self.device)
+                ans_start_idx = batch['ans_start_idx'].to(self.device)
+
+
+                elbo_loss, raw_loss, ddm_tokens = self._evaluate_ddm_batch(input_ids, labels, ans_start_idx)
                     
                 ddm_total_elbo += elbo_loss
                 ddm_total_raw += raw_loss
@@ -326,7 +339,7 @@ class SemanticEvaluator:
         return pd.DataFrame(results)
 
 class LLMJudgeEvaluator:
-    def __init__(self, model_name="gemma4", base_url="http://localhost:11434"):
+    def __init__(self, model_name="gemma4", base_url="http://localhost:11434/v1"):
         self.client = OpenAI(api_key="gemma4", base_url=base_url)
         self.model_name = model_name
         self.results = {'AR answer': 0, 'DiT uniform': 0, 'DiT positional dependent': 0, 'DiT sigmoid': 0, 'Errors': 0}
@@ -354,7 +367,9 @@ Do not include markdown codeblocks or extra text outside the JSON.
         print(f"\n🚀 Starting 4-Way Ranked LLM-as-a-Judge with Ollama ({self.model_name})...")
         models_cols = ['AR answer', 'DiT uniform', 'DiT positional dependent', 'DiT sigmoid']
         points_map = [3, 2, 1, 0]
-        for idx, row in tqdm(df_text.iterrows(), total=len(df_text)):
+        n_samples = 0
+        MAX_SAMPLES = 100
+        for idx, row in tqdm(df_text.iterrows(), total=MAX_SAMPLES, desc="Evaluating Rows"):
             prompt = str(row['context'])
             responses = {col: str(row[col]) for col in models_cols}
             shuffled_cols = list(responses.keys())
@@ -378,6 +393,9 @@ Do not include markdown codeblocks or extra text outside the JSON.
                     self.results['Errors'] += 1
             except Exception as e:
                 self.results['Errors'] += 1
+            n_samples += 1
+            if n_samples >= MAX_SAMPLES+1:  # Limit to MAX_SAMPLES samples for evaluation
+                break
         return self.print_report(len(df_text))
 
     def print_report(self, total_evaluated):
@@ -419,14 +437,51 @@ class DiffusionTrajectoryEvaluator:
         return entropy.mean().item()
 
     def _calculate_step_ppl(self, logits, masked_indices, target_labels):
-        masked_logits = logits[masked_indices]
-        masked_targets = target_labels[masked_indices]
-        if masked_logits.numel() == 0 or masked_targets.numel() == 0:
+        import torch
+        import torch.nn.functional as F
+
+        # To align with the model's sampling behavior, we must explicitly forbid
+        # predicting the [MASK] token. The SUBS parameterization does this by
+        # setting the logit for the [MASK] token to negative infinity. We
+        # replicate that logic here on a clone of the raw logits.
+        eval_logits = logits.clone()
+        eval_logits[:, :, self.mask_token_id] = -torch.inf
+
+        # 1. Extract predictions for the exact masked positions.
+        masked_logits = eval_logits[masked_indices]
+
+        # 2. If no tokens were masked, PPL is undefined. Return 1.0 (loss=0).
+        if masked_logits.numel() == 0:
             return 1.0
-        loss = F.cross_entropy(masked_logits, masked_targets, reduction='mean')
+            
+        # 3. Extract the ground truth labels for *those same masked positions*.
+        #    This ensures perfect alignment between predictions and targets.
+        masked_targets = target_labels[masked_indices]
+        
+        # 4. Calculate cross-entropy loss. `ignore_index` handles non-answer tokens.
+        loss = F.cross_entropy(
+            masked_logits,
+            masked_targets,
+            ignore_index=-100,
+            reduction='mean'
+        )
+
+        # 5. If loss is not finite (e.g., all targets were ignored), return 1.0.
+        if not torch.isfinite(loss):
+            return 1.0
+
         return torch.exp(loss).item()
 
     def update_step(self, step, logits, last_hidden_state, current_input_ids, target_labels):
+        """
+        Update the evaluator with metrics for a specific diffusion step.
+        arguments:
+            step (int): The current diffusion step.
+            logits (torch.Tensor): The model's output logits for the current step.
+            last_hidden_state (torch.Tensor): The last hidden state from the model for the current step.
+            current_input_ids (torch.Tensor): The input IDs at the current step, including masked tokens.
+            target_labels (torch.Tensor): The true labels corresponding to the input IDs, with -100 for non-target positions.
+        """
         masked_indices = (current_input_ids == self.mask_token_id)
         self._temp_batch_data['entropy'][step] = self._calculate_entropy(logits, masked_indices)
         self._temp_batch_data['step_ppl'][step] = self._calculate_step_ppl(logits, masked_indices, target_labels)
@@ -508,7 +563,7 @@ class BenchmarkManager:
         grouped_ds_ar = grouped_ds.rename_column("output_ids", "labels")
         grouped_ds_ar.set_format(type="torch", columns=["input_ids", "labels", "attention_mask"])
         grouped_ds_dit = grouped_ds.rename_column("output_ids", "labels")
-        grouped_ds_dit.set_format(type="torch", columns=["input_ids", "labels", "attention_mask"])
+        grouped_ds_dit.set_format(type="torch", columns=["input_ids", "labels", "attention_mask", "ans_start_idx"])
         self.val_dataloader_ar = self.dm_qa.getTrainloader(grouped_ds_ar, B=self.B)
         self.val_dataloader_dit = self.dm_qa.getTrainloader(grouped_ds_dit, B=self.B)
 
@@ -563,27 +618,37 @@ class BenchmarkManager:
         current_model.eval()
         dataloader = self.val_dataloader_ar if model_type == "ar" else self.val_dataloader_dit
         
-        collected_outputs = []
-        prompt_lengths = []
+        all_outputs = []
+        all_prompt_lengths = []
         
         with torch.no_grad():
             for batch in tqdm(dataloader, desc=f"Generating answers for {model_type.upper()}"):
                 prompts = batch['input_ids'].to(self.device)
-                batch_prompt_lengths = (batch['attention_mask'].sum(dim=1) - 1).tolist()
 
                 if model_type == "ddm":
-                    outputs = current_model.generate(prompts, ans_start_idx=batch.get('token_start_idx', None), 
-                                   num_steps=20)
-                else:
+                    # Correctly get ans_start_idx from the DDM dataloader
+                    ans_start_idx = batch.get('ans_start_idx')
+                    if ans_start_idx is not None:
+                        ans_start_idx = ans_start_idx.to(self.device)
+
+                    outputs = current_model.generate(prompts, ans_start_idx=ans_start_idx, num_steps=20)
+                    
+                    # For DDM, prompt length is ans_start_idx. Fallback to shape if not present.
+                    if ans_start_idx is None:
+                        batch_prompt_lengths = [prompts.shape[1]] * prompts.shape[0]
+                    else:
+                        batch_prompt_lengths = ans_start_idx.tolist()
+                else: # AR model
                     outputs = current_model.generate(prompts, n_tokens=256)
+                    # For AR, prompt length is the number of non-pad tokens from the attention mask.
+                    batch_prompt_lengths = batch['attention_mask'].sum(dim=1).tolist()
                         
-                collected_outputs.append(outputs.cpu().tolist())
-                prompt_lengths.extend(batch_prompt_lengths)
+                all_outputs.extend(outputs.cpu().tolist())
+                all_prompt_lengths.extend(batch_prompt_lengths)
                 gc.collect()
                 torch.cuda.empty_cache()
         
-        generated_answers = [token for batch in collected_outputs for token in batch]
-        return generated_answers, prompt_lengths
+        return all_outputs, all_prompt_lengths
 
     def decode_tokens_to_text(self, token_list, prompt_lengths=None):
         text_answers = []
@@ -592,173 +657,9 @@ class BenchmarkManager:
             text_answers.append(self.tokenizer.decode(response_tokens, skip_special_tokens=True))
         return text_answers
 
-    def sanitize_and_merge_csvs(self, save_filename="benchmark_tokens.pkl", pad_tokens=[50283, 50282, 0]):
+    def build_dataframe_from_partials(self, save_filename="benchmark_tokens.pkl"):
         import ast
-        import os
-        import pandas as pd
-        from tqdm import tqdm
-
-        print("\n👩‍💻 Processing CSV datasets, removing padding, and merging...")
-
-        # --- Helper: Parses string and removes left-padding ---
-        def clean_token_string(item):
-            # 1. Convert stringified list into a real Python list
-            if isinstance(item, str):
-                try:
-                    token_list = ast.literal_eval(item)
-                except (ValueError, SyntaxError):
-                    return []
-            elif isinstance(item, list):
-                token_list = item
-            else:
-                return []
-                
-            # 2. Aggressively strip the initial padding tokens from the left side
-            while len(token_list) > 0 and token_list[0] in pad_tokens:
-                token_list.pop(0)
-                
-            return token_list
-        # ------------------------------------------------------
-
-        csv_map = {
-            "AR answer": "ar_answers.csv",
-            "DiT uniform": "ddm_unif_answers.csv",
-            "DiT positional dependent": "ddm_posdip_answers.csv",
-            "DiT sigmoid": "ddm_sigm_answers.csv"
-        }
-        
-        merged_data = {}
-        
-        # 3. Load every CSV, parse the strings, and clean the padding
-        for col_name, file_name in csv_map.items():
-            file_path = os.path.join(self.dirs['datasets'], file_name)
-            if not os.path.exists(file_path):
-                print(f"⚠️ Warning: Could not find {file_path}. Skipping.")
-                continue
-                
-            print(f"📂 Cleaning and parsing {file_name}...")
-            df_csv = pd.read_csv(file_path)
-            
-            # Find the correct column name in the CSV
-            col_to_extract = col_name if col_name in df_csv.columns else df_csv.columns[0]
-            
-            raw_list = df_csv[col_to_extract].tolist()
-            
-            # Apply our cleaning function to every row
-            merged_data[col_name] = [clean_token_string(x) for x in raw_list]
-
-        # 4. Re-extract the true contexts and true answers from the dataloader
-        contexts = []
-        true_answers = []
-        if hasattr(self, 'val_dataloader_ar') and self.val_dataloader_ar:
-            print("🔍 Extracting Contexts and True Answers from Dataloader...")
-            for batch in self.val_dataloader_ar:
-                input_ids = batch['input_ids'].tolist()
-                labels = batch['labels'].tolist()
-                for seq, label_seq in zip(input_ids, labels):
-                    # Identify the boundaries of the true answer
-                    non_pad_indices = [i for i, lbl in enumerate(label_seq) if lbl != -100]
-                    if non_pad_indices:
-                        ans_start = non_pad_indices[0]
-                        ans_end = non_pad_indices[-1] + 1
-                        contexts.append(seq[:ans_start])
-                        true_answers.append(seq[ans_start:ans_end])
-                    else:
-                        contexts.append(seq)
-                        true_answers.append([])
-            
-            merged_data["context"] = contexts
-            merged_data["true answer"] = true_answers
-
-        # 5. Safely align all list lengths
-        min_len = min([len(v) for v in merged_data.values()])
-        print(f"📊 Merging data... Aligned dataset size: {min_len} samples.")
-        
-        for key in merged_data.keys():
-            merged_data[key] = merged_data[key][:min_len]
-
-        # 6. Save directly to a Pickle file
-        df_tokens = pd.DataFrame(merged_data)
-        full_save_path = os.path.join(self.dirs['datasets'], save_filename)
-        df_tokens.to_pickle(full_save_path)
-        
-        print(f"✅ Clean token dataset completely chiuso and saved to: {full_save_path}")
-        return df_tokens
-
-    def import_token_dataframe(self, save_filename="benchmark_tokens.pkl"):
-        import ast
-        print("\n👩‍💻 Building the Token-based Pandas Dataset...")
-        contexts, true_answers = [], []
-        
-        # 1. Gather contexts and true answers using the labels tensor
-        for batch in self.val_dataloader_ar:
-            input_ids = batch['input_ids'].tolist()
-            labels = batch['labels'].tolist()
-            
-            for seq, label_seq in zip(input_ids, labels):
-                try:
-                    # The answer starts at the first index where the label is NOT -100
-                    ans_start = next(i for i, lbl in enumerate(label_seq) if lbl != -100)
-                    
-                    # The answer ends at the last valid token (ignoring any padding at the very end)
-                    ans_end = len(label_seq) - next(i for i, lbl in enumerate(reversed(label_seq)) if lbl != -100)
-                    
-                    contexts.append(seq[:ans_start])
-                    true_answers.append(seq[ans_start:ans_end])
-                except StopIteration:
-                    # Safe fallback in case of a completely padded sequence
-                    contexts.append(seq)
-                    true_answers.append([])
-
-        # Helper function to safely convert stringified CSV lists back to real Python lists
-        def parse_string_list(item):
-            if isinstance(item, str):
-                try:
-                    return ast.literal_eval(item)
-                except (ValueError, SyntaxError):
-                    return item
-            return item
-
-        # 2. Import the datasets from the CSV files and fix the strings
-        print("📂 Loading DDM tokens from CSVs...")
-        ddm_unif_answers_df = pd.read_csv(os.path.join(self.dirs['datasets'], "ddm_unif_answers.csv"))
-        ddm_unif_answers = [parse_string_list(x) for x in ddm_unif_answers_df["DiT uniform"].tolist()]
-        
-        ddm_posdip_answers_df = pd.read_csv(os.path.join(self.dirs['datasets'], "ddm_posdip_answers.csv"))
-        ddm_posdip_answers = [parse_string_list(x) for x in ddm_posdip_answers_df["DiT positional dependent"].tolist()]
-        
-        ddm_sigm_answers_df = pd.read_csv(os.path.join(self.dirs['datasets'], "ddm_sigm_answers.csv"))
-        ddm_sigm_answers = [parse_string_list(x) for x in ddm_sigm_answers_df["DiT sigmoid"].tolist()]
-
-        # 3. Generate the AR answers
-        ar_tokens, ar_lengths = self.generate_token_answers(model_type="ar")
-        ar_answers = [seq[p:] for seq, p in zip(ar_tokens, ar_lengths)]
-        ar_answers_df = pd.DataFrame({"AR answer": ar_answers})
-        ar_answers_df.to_csv(os.path.join(self.dirs['datasets'], "ar_answers.csv"), index=False)
-
-        # 4. Construct the final clean DataFrame
-        min_len = min(len(contexts), len(ar_answers), len(ddm_unif_answers), len(ddm_posdip_answers), len(ddm_sigm_answers))
-        data = {
-            "context": contexts[:min_len], 
-            "true answer": true_answers[:min_len], 
-            "AR answer": ar_answers[:min_len],
-            "DiT uniform": ddm_unif_answers[:min_len], 
-            "DiT positional dependent": ddm_posdip_answers[:min_len], 
-            "DiT sigmoid": ddm_sigm_answers[:min_len]
-        }
-        
-        df_tokens = pd.DataFrame(data)
-        
-        # 5. Save to Pickle
-        full_save_path = os.path.join(self.dirs['datasets'], save_filename)
-        df_tokens.to_pickle(full_save_path)
-        print(f"\n✅ Token Pandas Dataset successfully saved to: {full_save_path}")
-        
-        return df_tokens
-
-    def rebuild_clean_token_dataframe(self, save_filename="benchmark_tokens.pkl"):
-        import ast
-        print("\n👩‍💻 Rebuilding Contexts & True Answers from Dataloader...")
+        print("\n👩‍💻 Merging partial datasets from .pkl files...")
         
         contexts = []
         true_answers = []
@@ -785,78 +686,58 @@ class BenchmarkManager:
                 contexts.append(context)
                 true_answers.append(true_ans)
 
-        # Helper to safely parse stringified token lists from CSVs
-        def parse_token_list(item):
-            if isinstance(item, str):
-                try:
-                    return ast.literal_eval(item)
-                except (ValueError, SyntaxError):
-                    return item
-            return item
-
-        # 2. Load existing CSV files and convert strings back to lists
-        print("📂 Loading and parsing token outputs from existing CSV files...")
-        
-        csv_map = {
-            "AR answer": ("ar_answers.csv", "AR answer"),
-            "DiT uniform": ("ddm_unif_answers.csv", "DiT uniform"),
-            "DiT positional dependent": ("ddm_posdip_answers.csv", "DiT positional dependent"),
-            "DiT sigmoid": ("ddm_sigm_answers.csv", "DiT sigmoid")
+        # 2. Define the partial files and load them
+        partial_files = {
+            "AR answer": "ar_answers.pkl",
+            "DiT uniform": "ddm_unif_answers.pkl",
+            "DiT positional dependent": "ddm_posdip_answers.pkl",
+            "DiT sigmoid": "ddm_sigm_answers.pkl"
         }
         
         loaded_outputs = {}
-        for col_name, (file_name, csv_col) in csv_map.items():
+        for col_name, file_name in partial_files.items():
             file_path = os.path.join(self.dirs['datasets'], file_name)
             if not os.path.exists(file_path):
-                raise FileNotFoundError(f"❌ Missing required CSV file: {file_path}")
-                
-            df_csv = pd.read_csv(file_path)
-            raw_list = df_csv[csv_col].tolist()
-            loaded_outputs[col_name] = [parse_token_list(x) for x in raw_list]
+                raise FileNotFoundError(f"❌ Missing partial dataset: {file_path}. Please run `build_token_dataframe` first.")
+            print(f"📂 Loading {file_name}...")
+            # pd.read_pickle returns the DataFrame we saved. We extract the first (and only) column.
+            loaded_outputs[col_name] = pd.read_pickle(file_path).iloc[:, 0].tolist()
 
-        # 3. Safely align lengths across all columns
-        min_len = min(
-            len(contexts),
-            len(true_answers),
-            len(loaded_outputs["AR answer"]),
-            len(loaded_outputs["DiT uniform"]),
-            len(loaded_outputs["DiT positional dependent"]),
-            len(loaded_outputs["DiT sigmoid"])
-        )
+        # 3. Create context/answer DataFrame and merge everything
+        all_data = {
+            "context": contexts,
+            "true answer": true_answers,
+            **loaded_outputs
+        }
+
+        # 4. Align all list lengths to the shortest one to create a valid DataFrame
+        min_len = min(len(v) for v in all_data.values())
+        print(f"📊 Aligning all datasets to the shortest length: {min_len} samples.")
         
-        print(f"📊 Aligned dataset size: {min_len} samples.")
+        aligned_data = {k: v[:min_len] for k, v in all_data.items()}
+        
+        df_tokens = pd.DataFrame(aligned_data)
 
-        # 4. Construct clean token DataFrame
-        df_tokens = pd.DataFrame({
-            "context": contexts[:min_len],
-            "true answer": true_answers[:min_len],
-            "AR answer": loaded_outputs["AR answer"][:min_len],
-            "DiT uniform": loaded_outputs["DiT uniform"][:min_len],
-            "DiT positional dependent": loaded_outputs["DiT positional dependent"][:min_len],
-            "DiT sigmoid": loaded_outputs["DiT sigmoid"][:min_len]
-        })
-
-        # 5. Save directly to pickle
+        # 5. Save the final merged dataframe
         full_save_path = os.path.join(self.dirs['datasets'], save_filename)
         df_tokens.to_pickle(full_save_path)
-        print(f"✅ Clean token dataset successfully created and saved to: {full_save_path}")
+        print(f"✅ Merged token dataset saved to: {full_save_path}")
         
         return df_tokens
 
     def build_token_dataframe(self, save_filename="benchmark_tokens.pkl"):
         print("\n👩‍💻 Building the Token-based Pandas Dataset...")
         contexts, true_answers = [], []
-        for batch in self.val_dataloader_ar:
+        for batch in tqdm(self.val_dataloader_ar, desc="Extracting Contexts & True Answers"):
             input_ids = batch['input_ids'].tolist()
             labels = batch['labels'].tolist()
             
             for seq, label_seq in zip(input_ids, labels):
                 try:
-                    # The answer starts at the first index where the label is NOT -100
-                    ans_start = next(i for i, lbl in enumerate(label_seq) if lbl != -100)
-                    
-                    # The answer ends at the last valid token (ignoring any padding at the very end)
-                    ans_end = len(label_seq) - next(i for i, lbl in enumerate(reversed(label_seq)) if lbl != -100)
+                    # Find all positions where labels are NOT -100 (this marks the answer)
+                    non_pad_indices = [i for i, lbl in enumerate(label_seq) if lbl != -100]
+                    ans_start = non_pad_indices[0]
+                    ans_end = non_pad_indices[-1] + 1
                     
                     contexts.append(seq[:ans_start])
                     true_answers.append(seq[ans_start:ans_end])
@@ -868,22 +749,22 @@ class BenchmarkManager:
         ddm_unif_tokens, ddm_unif_lengths = self.generate_token_answers(model_type="ddm", model_variant="unif")
         ddm_unif_answers = [seq[p:] for seq, p in zip(ddm_unif_tokens, ddm_unif_lengths)]
         ddm_unif_answers_df = pd.DataFrame({"DiT uniform": ddm_unif_answers})
-        ddm_unif_answers_df.to_csv(os.path.join(self.dirs['datasets'], "ddm_unif_answers.csv"), index=False)
+        ddm_unif_answers_df.to_pickle(os.path.join(self.dirs['datasets'], "ddm_unif_answers.pkl"))
         
         ddm_posdip_tokens, ddm_posdip_lengths = self.generate_token_answers(model_type="ddm", model_variant="posdip")
         ddm_posdip_answers = [seq[p:] for seq, p in zip(ddm_posdip_tokens, ddm_posdip_lengths)]
         ddm_posdip_answers_df = pd.DataFrame({"DiT positional dependent": ddm_posdip_answers})
-        ddm_posdip_answers_df.to_csv(os.path.join(self.dirs['datasets'], "ddm_posdip_answers.csv"), index=False)
+        ddm_posdip_answers_df.to_pickle(os.path.join(self.dirs['datasets'], "ddm_posdip_answers.pkl"))
         
         ddm_sigm_tokens, ddm_sigm_lengths = self.generate_token_answers(model_type="ddm", model_variant="sigm")
         ddm_sigm_answers = [seq[p:] for seq, p in zip(ddm_sigm_tokens, ddm_sigm_lengths)]
         ddm_sigm_answers_df = pd.DataFrame({"DiT sigmoid": ddm_sigm_answers})
-        ddm_sigm_answers_df.to_csv(os.path.join(self.dirs['datasets'], "ddm_sigm_answers.csv"), index=False)
+        ddm_sigm_answers_df.to_pickle(os.path.join(self.dirs['datasets'], "ddm_sigm_answers.pkl"))
 
         ar_tokens, ar_lengths = self.generate_token_answers(model_type="ar")
         ar_answers = [seq[p:] for seq, p in zip(ar_tokens, ar_lengths)]
         ar_answers_df = pd.DataFrame({"AR answer": ar_answers})
-        ar_answers_df.to_csv(os.path.join(self.dirs['datasets'], "ar_answers.csv"), index=False)
+        ar_answers_df.to_pickle(os.path.join(self.dirs['datasets'], "ar_answers.pkl"))
 
         min_len = min(len(contexts), len(ar_answers), len(ddm_unif_answers), len(ddm_posdip_answers), len(ddm_sigm_answers))
         data = {
@@ -996,13 +877,67 @@ class BenchmarkManager:
         except FileNotFoundError:
             print(f"❌ Error: Could not find {full_load_path}.")
             return
-            
-        judge = LLMJudgeEvaluator(model_name="gemma4", base_url="http://localhost:11434/v1")
-        df_results = judge.evaluate_dataframe(df_text=df)
+
+        import socket, subprocess, time
+
+        # --- Automated Server Management ---
+        server_process = None
         
-        full_save_path = os.path.join(self.dirs['metrics'], save_filename)
-        df_results.to_csv(full_save_path, index=False)
-        print(f"✅ Saved LLM Judge results to {full_save_path}")
+        # First, check if the server is already running.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            is_server_running = s.connect_ex(('localhost', 11434)) == 0
+
+        if not is_server_running:
+            print("LLM Judge server not found. Starting it automatically...")
+            command = "ollama run gemma4"
+            
+            # Use Popen to run the command in the background, hiding its output.
+            server_process = subprocess.Popen(command, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"Server process started with PID: {server_process.pid}. Waiting for it to become ready...")
+
+            # Poll the server until it's ready or we time out.
+            max_wait_seconds = 30
+            wait_start_time = time.time()
+            server_ready = False
+            while time.time() - wait_start_time < max_wait_seconds:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_check:
+                    if s_check.connect_ex(('localhost', 11434)) == 0:
+                        print("✅ Server is ready.")
+                        server_ready = True
+                        break
+                time.sleep(1)
+            
+            if not server_ready:
+                print(f"❌ Server failed to start within {max_wait_seconds} seconds. Aborting.")
+                if server_process:
+                    server_process.terminate()
+                    server_process.wait()
+                return
+        else:
+            print("LLM Judge server is already running. Proceeding with evaluation.")
+
+        try:
+            # This is the main evaluation logic.
+            judge = LLMJudgeEvaluator(model_name="gemma4", base_url="http://localhost:11434/v1")
+            df_results = judge.evaluate_dataframe(df_text=df)
+            
+            full_save_path = os.path.join(self.dirs['metrics'], save_filename)
+            df_results.to_csv(full_save_path, index=False)
+            print(f"✅ Saved LLM Judge results to {full_save_path}")
+
+        finally:
+            # This block guarantees that if we started the server, we also stop it.
+            if server_process:
+                print("\nShutting down the automatically started LLM Judge server...")
+                server_process.terminate()
+                try:
+                    # Wait for a few seconds for the process to terminate gracefully
+                    server_process.wait(timeout=5)
+                    print("Server shut down successfully.")
+                except subprocess.TimeoutExpired:
+                    print("Server did not terminate gracefully. Forcing shutdown...")
+                    server_process.kill()
+                    print("Server process killed.")
 
     def run_trajectory_evaluation(self, num_steps=20, max_samples=100):
         print("\n" + "="*50)
@@ -1020,7 +955,7 @@ class BenchmarkManager:
             samples_processed = 0
             
             with torch.no_grad():
-                for batch in tqdm(self.val_dataloader_dit, desc=f"Evaluating Trajectory ({variant})"):
+                for batch in tqdm(self.val_dataloader_dit, total=max_samples, desc=f"Evaluating Trajectory ({variant})"):
                     
                     # 1. Determine how many samples are needed to reach exactly max_samples
                     needed = max_samples - samples_processed
@@ -1036,9 +971,9 @@ class BenchmarkManager:
                     # 3. Generate and evaluate
                     model.generate(
                         prompts, 
-                        token_start_idx=token_start_idx, 
+                        ans_start_idx=token_start_idx, 
                         num_steps=num_steps, 
-                        evaluate_elements=[evaluator, labels]
+                        evaluation_elements=[evaluator, labels]
                     )
                     
                     evaluator.finalize_batch()
@@ -1096,7 +1031,7 @@ class GraphsGenerator:
         plt.figure(figsize=(10, 6))
         
         # We extract each column, dropping the NaNs (since models might have slightly different sample counts)
-        data_to_plot = [lengths_df[col].dropna() for col in lengths_df.columns]
+        data_to_plot = [(lengths_df[col].dropna()) for col in lengths_df.columns]
         
         # Create the boxplot (patch_artist=True allows us to fill the boxes with color)
         box = plt.boxplot(data_to_plot, labels=lengths_df.columns, patch_artist=True)
@@ -1256,6 +1191,26 @@ class GraphsGenerator:
             plt.savefig(full_save_path, format='png', bbox_inches='tight')
             plt.close() 
             print(f"✅ Saved graph: {full_save_path}")
+
+        plt.figure(figsize=(8, 6))
+        for variant_name, df in dataframes.items():
+            plt.plot(
+                df['step'], df[metric["column"]], label=variant_name,
+                color=styles[variant_name]["color"], marker=styles[variant_name]["marker"], 
+                linewidth=2.5, markersize=7
+            )
+
+        plt.title(metric["title"], fontsize=14, fontweight='bold', pad=15)
+        plt.xlabel("Generative Steps (t)", fontsize=12)
+        plt.ylabel(metric["ylabel"], fontsize=12)
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.legend(fontsize=11)
+        plt.tight_layout()
+        
+        full_save_path = os.path.join(self.dirs['plots'], metric["filename"])
+        plt.savefig(full_save_path, format='png', bbox_inches='tight')
+        plt.close() 
+        print(f"✅ Saved graph: {full_save_path}")
             
         print("🎉 All 3 trajectory graphs successfully generated!")
 
@@ -1264,22 +1219,21 @@ if __name__ == "__main__":
     manager = BenchmarkManager(config_path="config.yaml")
 
     manager.tokenize_and_group()
-    #manager.run_perplexity_benchmark(save_filename="perplexity_results.csv")
-    #manager.build_token_dataframe(save_filename="benchmark_tokens.pkl")
-    #manager.import_token_dataframe(save_filename="benchmark_tokens.pkl")
-    #manager.sanitize_and_merge_csvs(save_filename="benchmark_tokens.pkl")
-    #manager.build_text_dataframe(load_filename="benchmark_tokens.pkl", save_filename="benchmark_text.csv")
+    manager.build_token_dataframe(save_filename="benchmark_tokens.pkl")
+    #manager.build_dataframe_from_partials(save_filename="benchmark_tokens.pkl")
+    manager.run_perplexity_benchmark(save_filename="perplexity_results.csv")
+    manager.build_text_dataframe(load_filename="benchmark_tokens.pkl", save_filename="benchmark_text.csv")
     manager.run_structure_evaluation(load_filename="benchmark_tokens.pkl", save_filename="structure_evaluation_results.csv")
-    #manager.run_diversity_evaluation(load_filename="benchmark_tokens.pkl", save_filename="diversity_evaluation_results.csv")
-    #manager.run_semantic_evaluation(load_filename="benchmark_text.csv", save_filename="semantic_evaluation_results.csv")
-    #manager.run_llm_judge_evaluation(load_filename="benchmark_text.csv", save_filename="llm_judge_results.csv")
-    #manager.run_trajectory_evaluation(num_steps=20)
+    manager.run_diversity_evaluation(load_filename="benchmark_tokens.pkl", save_filename="diversity_evaluation_results.csv")
+    manager.run_semantic_evaluation(load_filename="benchmark_text.csv", save_filename="semantic_evaluation_results.csv")
+    manager.run_trajectory_evaluation(num_steps=20)
+    manager.run_llm_judge_evaluation(load_filename="benchmark_text.csv", save_filename="llm_judge_results.csv")
 
     gg = GraphsGenerator()
 
-    #gg.generate_perplexity_graph(csv_filename="perplexity_results.csv")
+    gg.generate_perplexity_graph(csv_filename="perplexity_results.csv")
     gg.generate_structure_evaluation_graph(csv_filename="structure_evaluation_results.csv")
-    #gg.generate_diversity_evaluation_graph(csv_filename="diversity_evaluation_results.csv")
-    #gg.generate_semantic_evaluation_graph(csv_filename="semantic_evaluation_results.csv")
-    #gg.generate_llm_judge_graph(csv_filename="llm_judge_results.csv")
-    #gg.generate_trajectory_graphs()
+    gg.generate_diversity_evaluation_graph(csv_filename="diversity_evaluation_results.csv")
+    gg.generate_semantic_evaluation_graph(csv_filename="semantic_evaluation_results.csv")
+    gg.generate_trajectory_graphs()
+    gg.generate_llm_judge_graph(csv_filename="llm_judge_results.csv")
