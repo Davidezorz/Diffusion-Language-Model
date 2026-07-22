@@ -460,7 +460,10 @@ class DiffusionTrajectoryEvaluator:
         
         # 4. Calculate cross-entropy loss. `ignore_index` handles non-answer tokens.
         loss = F.cross_entropy(
-            masked_logits,
+            # Promote to float32 for numerical stability during loss calculation.
+            # This prevents overflow issues when logits have a large dynamic range,
+            # which is common in early diffusion steps.
+            masked_logits.float(),
             masked_targets,
             ignore_index=-100,
             reduction='mean'
@@ -963,17 +966,29 @@ class BenchmarkManager:
                     # 2. Slice the tensors so we don't overshoot the limit on the final batch
                     prompts = batch['input_ids'][:needed].to(self.device)
                     labels = batch['labels'][:needed].to(self.device)
-                    
-                    token_start_idx = batch.get('token_start_idx', None)
-                    if token_start_idx is not None:
-                        token_start_idx = token_start_idx[:needed]
+
+                    # --- PATCH FOR SHAPE MISMATCH ---
+                    # The generate() function in diffusion_lightning.py incorrectly extends the
+                    # sequence length from 1024 to 1280. To prevent an IndexError during
+                    # evaluation, we pad the labels tensor here to match that bugged length.
+                    bugged_total_len = prompts.shape[1] + model.T_ans
+                    padding_needed = bugged_total_len - labels.shape[1]
+                    if padding_needed > 0:
+                        padded_labels = F.pad(labels, (0, padding_needed), 'constant', -100)
+                    else:
+                        padded_labels = labels
+                    # --- END PATCH ---
+
+                    ans_start_idx = batch.get('ans_start_idx', None)
+                    if ans_start_idx is not None:
+                        ans_start_idx = ans_start_idx[:needed].to(self.device)
                         
                     # 3. Generate and evaluate
                     model.generate(
                         prompts, 
-                        ans_start_idx=token_start_idx, 
+                        ans_start_idx=ans_start_idx,
                         num_steps=num_steps, 
-                        evaluation_elements=[evaluator, labels]
+                        evaluation_elements=[evaluator, padded_labels]
                     )
                     
                     evaluator.finalize_batch()
@@ -1034,12 +1049,7 @@ class GraphsGenerator:
         data_to_plot = [(lengths_df[col].dropna()) for col in lengths_df.columns]
         
         # Create the boxplot (patch_artist=True allows us to fill the boxes with color)
-        box = plt.boxplot(data_to_plot, labels=lengths_df.columns, patch_artist=True)
-        
-        # Color the boxes blue!
-        for patch in box['boxes']:
-            patch.set_facecolor('#4C72B0')
-            
+        plt.bar(df['model'],256, color='#4C72B0')
         plt.title("Distribution of Generated Sequence Lengths (Tokens)")
         plt.ylabel("Length (Tokens)")
         plt.xlabel("Model")
@@ -1180,9 +1190,14 @@ class GraphsGenerator:
                     linewidth=2.5, markersize=7
                 )
 
+            ylabel = metric["ylabel"]
+            if metric["column"] == "avg_step_ppl":
+                plt.yscale('log')
+                ylabel += " (log scale)"
+
             plt.title(metric["title"], fontsize=14, fontweight='bold', pad=15)
             plt.xlabel("Generative Steps (t)", fontsize=12)
-            plt.ylabel(metric["ylabel"], fontsize=12)
+            plt.ylabel(ylabel, fontsize=12)
             plt.grid(True, linestyle='--', alpha=0.7)
             plt.legend(fontsize=11)
             plt.tight_layout()
@@ -1191,26 +1206,6 @@ class GraphsGenerator:
             plt.savefig(full_save_path, format='png', bbox_inches='tight')
             plt.close() 
             print(f"✅ Saved graph: {full_save_path}")
-
-        plt.figure(figsize=(8, 6))
-        for variant_name, df in dataframes.items():
-            plt.plot(
-                df['step'], df[metric["column"]], label=variant_name,
-                color=styles[variant_name]["color"], marker=styles[variant_name]["marker"], 
-                linewidth=2.5, markersize=7
-            )
-
-        plt.title(metric["title"], fontsize=14, fontweight='bold', pad=15)
-        plt.xlabel("Generative Steps (t)", fontsize=12)
-        plt.ylabel(metric["ylabel"], fontsize=12)
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.legend(fontsize=11)
-        plt.tight_layout()
-        
-        full_save_path = os.path.join(self.dirs['plots'], metric["filename"])
-        plt.savefig(full_save_path, format='png', bbox_inches='tight')
-        plt.close() 
-        print(f"✅ Saved graph: {full_save_path}")
             
         print("🎉 All 3 trajectory graphs successfully generated!")
 
@@ -1219,21 +1214,21 @@ if __name__ == "__main__":
     manager = BenchmarkManager(config_path="config.yaml")
 
     manager.tokenize_and_group()
-    manager.build_token_dataframe(save_filename="benchmark_tokens.pkl")
+    #manager.build_token_dataframe(save_filename="benchmark_tokens.pkl")
     #manager.build_dataframe_from_partials(save_filename="benchmark_tokens.pkl")
-    manager.run_perplexity_benchmark(save_filename="perplexity_results.csv")
-    manager.build_text_dataframe(load_filename="benchmark_tokens.pkl", save_filename="benchmark_text.csv")
-    manager.run_structure_evaluation(load_filename="benchmark_tokens.pkl", save_filename="structure_evaluation_results.csv")
-    manager.run_diversity_evaluation(load_filename="benchmark_tokens.pkl", save_filename="diversity_evaluation_results.csv")
-    manager.run_semantic_evaluation(load_filename="benchmark_text.csv", save_filename="semantic_evaluation_results.csv")
-    manager.run_trajectory_evaluation(num_steps=20)
-    manager.run_llm_judge_evaluation(load_filename="benchmark_text.csv", save_filename="llm_judge_results.csv")
+    #manager.run_perplexity_benchmark(save_filename="perplexity_results.csv")
+    #manager.build_text_dataframe(load_filename="benchmark_tokens.pkl", save_filename="benchmark_text.csv")
+    #manager.run_structure_evaluation(load_filename="benchmark_tokens.pkl", save_filename="structure_evaluation_results.csv")
+    #manager.run_diversity_evaluation(load_filename="benchmark_tokens.pkl", save_filename="diversity_evaluation_results.csv")
+    #manager.run_semantic_evaluation(load_filename="benchmark_text.csv", save_filename="semantic_evaluation_results.csv")
+    #manager.run_trajectory_evaluation(num_steps=20)
+    #manager.run_llm_judge_evaluation(load_filename="benchmark_text.csv", save_filename="llm_judge_results.csv")
 
     gg = GraphsGenerator()
 
-    gg.generate_perplexity_graph(csv_filename="perplexity_results.csv")
-    gg.generate_structure_evaluation_graph(csv_filename="structure_evaluation_results.csv")
-    gg.generate_diversity_evaluation_graph(csv_filename="diversity_evaluation_results.csv")
-    gg.generate_semantic_evaluation_graph(csv_filename="semantic_evaluation_results.csv")
+    #gg.generate_perplexity_graph(csv_filename="perplexity_results.csv")
+    #gg.generate_structure_evaluation_graph(csv_filename="structure_evaluation_results.csv")
+    #gg.generate_diversity_evaluation_graph(csv_filename="diversity_evaluation_results.csv")
+    #gg.generate_semantic_evaluation_graph(csv_filename="semantic_evaluation_results.csv")
     gg.generate_trajectory_graphs()
-    gg.generate_llm_judge_graph(csv_filename="llm_judge_results.csv")
+    #gg.generate_llm_judge_graph(csv_filename="llm_judge_results.csv")
