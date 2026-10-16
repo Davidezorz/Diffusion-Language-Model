@@ -223,3 +223,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+*.csv
+*.png
+*.pkl
+config.yaml
